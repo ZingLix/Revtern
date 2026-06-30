@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: revtern
+      POSTGRES_PASSWORD: revtern
+      POSTGRES_DB: revtern
+    ports:
+      - "5432:5432"
+    volumes:
+      - revtern-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U revtern -d revtern"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://revtern:revtern@postgres:5432/revtern
+      REVTERN_BASE_URL: http://localhost:3000
+      REVTERN_BIND: 0.0.0.0:3000
+      REVTERN_ENV: development
+      REVTERN_AUTH_MODE: single_user
+      REVTERN_SECRET_KEY: change-this-to-a-long-random-secret-before-production
+      REVTERN_WEB_DIST: /app/web
+    ports:
+      - "3000:3000"
+
+volumes:
+  revtern-postgres:

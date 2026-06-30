@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "paths": {
+      "@revtern/api-client": ["../../packages/api-client/src/index.ts"],
+      "@revtern/types": ["../../packages/types/src/index.ts"]
+    }
+  },
+  "include": ["src", "vite.config.ts", "../../packages/api-client/src", "../../packages/types/src"]
+}

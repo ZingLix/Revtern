@@ -1,0 +1,20 @@
+{
+  "name": "revtern",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.16.0",
+  "workspaces": [
+    "apps/web",
+    "packages/api-client",
+    "packages/types"
+  ],
+  "scripts": {
+    "dev:api": "cargo run -p revtern-api",
+    "dev:web": "npm run dev -w @revtern/web",
+    "build:web": "npm run build -w @revtern/web",
+    "typecheck": "npm run typecheck -w @revtern/web",
+    "check:api": "cargo check",
+    "check": "cargo check && npm run typecheck"
+  }
+}
