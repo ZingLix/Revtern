@@ -24,7 +24,7 @@ RUN cargo build --release -p revtern-api
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates libssl3 wget \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

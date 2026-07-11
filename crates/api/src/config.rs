@@ -62,6 +62,21 @@ impl Config {
                 "REVTERN_AUTH_MODE=disabled is only allowed in development or with REVTERN_UNSAFE_DISABLE_AUTH=1"
             );
         }
+        if environment != "development"
+            && (secret_key.len() < 32
+                || secret_key.contains("change-before-production")
+                || secret_key.contains("change-this"))
+        {
+            anyhow::bail!(
+                "REVTERN_SECRET_KEY must be a unique secret of at least 32 characters outside development"
+            );
+        }
+        if environment != "development" && !base_url.starts_with("https://") {
+            tracing::warn!(
+                base_url,
+                "REVTERN_BASE_URL is not HTTPS; terminate TLS at a trusted reverse proxy before receiving production webhooks"
+            );
+        }
 
         Ok(Arc::new(Self {
             database_url,

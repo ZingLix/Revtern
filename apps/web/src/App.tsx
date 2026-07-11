@@ -2,15 +2,35 @@ import { ApiError, type CatalogConfirmation } from "@revtern/api-client";
 import type {
   AppRecord,
   DataSourceRecord,
-  JobRecord,
   LogicalProductRecord,
   RawEventRecord,
-  SourceProductRecord,
+  SubscriptionRecord,
   TransactionRecord,
 } from "@revtern/types";
+import {
+  Alert,
+  Button,
+  Card,
+  Checkbox,
+  Chip,
+  Drawer,
+  EmptyState as HeroEmptyState,
+  Input,
+  ListBox,
+  Link,
+  Select,
+  Table,
+  TextArea,
+  ToggleButton,
+  ToggleButtonGroup,
+  Toolbar,
+  Typography,
+  useOverlayState,
+} from "@heroui/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  ArrowUpRight,
   Boxes,
   Check,
   CloudDownload,
@@ -27,11 +47,13 @@ import {
   RefreshCw,
   Search,
   Settings,
+  ShieldCheck,
   SquareStack,
+  TrendingUp,
   X,
 } from "lucide-react";
 import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
-import { NavLink, Navigate, Route, Routes } from "react-router-dom";
+import { NavLink as RouterNavLink, Navigate, Route, Routes } from "react-router-dom";
 import {
   Bar,
   BarChart,
@@ -46,7 +68,7 @@ import {
 } from "recharts";
 import { API_BASE_URL, api } from "./api";
 import { buildCatalogDraft, type CatalogDraftGroup } from "./lib/catalog";
-import { formatDate, formatDateTime, formatMoney, formatNumber, formatPercent, last30Days, titleize } from "./lib/format";
+import { formatCompactMoney, formatDate, formatDateTime, formatMoney, formatNumber, formatPercent, last30Days, titleize } from "./lib/format";
 
 const navItems = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
@@ -91,13 +113,15 @@ function BootScreen() {
 function AuthFrame({ children }: { children: ReactNode }) {
   return (
     <main className="auth-page">
-      <section className="auth-panel">
-        <div className="brand-row">
-          <span className="brand-mark">R</span>
-          <strong>Revtern</strong>
-        </div>
-        {children}
-      </section>
+      <Card className="auth-panel" variant="default">
+        <Card.Content className="auth-panel__content">
+          <div className="brand-row">
+            <span className="brand-mark">R</span>
+            <strong>Revtern</strong>
+          </div>
+          {children}
+        </Card.Content>
+      </Card>
     </main>
   );
 }
@@ -125,19 +149,19 @@ function SetupScreen() {
       >
         <h1>First-run setup</h1>
         <Field label="Owner email">
-          <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoFocus required />
+          <Input fullWidth value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoFocus required variant="secondary" />
         </Field>
         <Field label="Password">
-          <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" minLength={8} required />
+          <Input fullWidth value={password} onChange={(event) => setPassword(event.target.value)} type="password" minLength={8} required variant="secondary" />
         </Field>
         <Field label="Workspace">
-          <input value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} required />
+          <Input fullWidth value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} required variant="secondary" />
         </Field>
         {mutation.error ? <ErrorBlock error={mutation.error} /> : null}
-        <button className="primary-button" disabled={mutation.isPending}>
+        <Button isDisabled={mutation.isPending} size="sm" type="submit" variant="primary">
           <Check size={16} />
           Create owner
-        </button>
+        </Button>
       </form>
     </AuthFrame>
   );
@@ -166,16 +190,16 @@ function LoginScreen({ authMode }: { authMode: string }) {
         <h1>Sign in</h1>
         {authMode === "reverse_proxy" ? <p className="muted">Reverse proxy mode is enabled; the trusted user header was not present.</p> : null}
         <Field label="Email">
-          <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoFocus required />
+          <Input fullWidth value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoFocus required variant="secondary" />
         </Field>
         <Field label="Password">
-          <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" required />
+          <Input fullWidth value={password} onChange={(event) => setPassword(event.target.value)} type="password" required variant="secondary" />
         </Field>
         {mutation.error ? <ErrorBlock error={mutation.error} /> : null}
-        <button className="primary-button" disabled={mutation.isPending}>
+        <Button isDisabled={mutation.isPending} size="sm" type="submit" variant="primary">
           <Check size={16} />
           Sign in
-        </button>
+        </Button>
       </form>
     </AuthFrame>
   );
@@ -204,19 +228,24 @@ function AppShell({ me }: { me: { user: { email: string; role: string }; workspa
           {navItems.map((item) => {
             const Icon = item.icon;
             return (
-              <NavLink key={item.to} to={item.to} end={item.to === "/"} className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
+              <RouterNavLink
+                key={item.to}
+                to={item.to}
+                end={item.to === "/"}
+                className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}
+              >
                 <Icon size={17} />
                 {item.label}
-              </NavLink>
+              </RouterNavLink>
             );
           })}
         </nav>
         <div className="sidebar-footer">
           <span>{me.user.email}</span>
-          <button className="icon-text-button" onClick={() => logout.mutate()} disabled={logout.isPending}>
+          <Button className="sidebar-action" isDisabled={logout.isPending} onPress={() => logout.mutate()} size="sm" variant="ghost">
             <LogOut size={16} />
             Log out
-          </button>
+          </Button>
         </div>
       </aside>
       <main className="main-area">
@@ -243,91 +272,193 @@ function OverviewPage() {
   const [filters, setFilters] = useDashboardFilters();
   const overview = useQuery({ queryKey: ["overview", filters], queryFn: () => api.overview(filters) });
   const series = useQuery({ queryKey: ["revenue-series", filters], queryFn: () => api.revenueTimeseries(filters) });
-  const transactions = useQuery({ queryKey: ["transactions", "recent"], queryFn: () => api.transactions({ ...filters }), placeholderData: (previous) => previous });
+  const transactions = useQuery({ queryKey: ["transactions", "recent", filters], queryFn: () => api.transactions({ ...filters }), placeholderData: (previous) => previous });
   const sources = useQuery({ queryKey: ["data-sources"], queryFn: () => api.dataSources() });
+  const sourceProducts = useQuery({ queryKey: ["source-products", "overview"], queryFn: () => api.sourceProducts() });
   const seed = useMutation({
     mutationFn: () => api.seedDemo(),
     onSuccess: async () => {
       await queryClient.invalidateQueries();
     },
   });
+  const revenueSeries = series.data?.series ?? [];
+  const warningCount = overview.data?.warnings.length ?? 0;
+  const sourceRows = sources.data?.data_sources ?? [];
+  const sourceIssueCount = sourceRows.filter((source) => ["error", "failed", "dead"].includes(source.status.toLowerCase())).length;
+  const unmappedCount = (sourceProducts.data?.source_products ?? []).filter((product) => product.mapping_state === "unmapped").length;
+  const trustState = overview.data?.metrics.gross_revenue_minor.trust_state ?? "estimated";
+  const metrics = overview.data?.metrics;
+  const supportingMetrics = [
+    {
+      label: "Net revenue",
+      value: formatMoney(metrics?.net_revenue_minor.value, overview.data?.currency),
+      state: metrics?.net_revenue_minor.trust_state,
+      delta: "Gross − refunds",
+    },
+    {
+      label: "Active subscriptions",
+      value: formatNumber(metrics?.active_subscriptions.value),
+      state: metrics?.active_subscriptions.trust_state,
+      delta: `${formatNumber(metrics?.new_subscriptions.value)} new`,
+    },
+    {
+      label: "Renewals",
+      value: formatNumber(metrics?.renewals.value),
+      state: metrics?.renewals.trust_state,
+      delta: "Period total",
+    },
+    {
+      label: "Refunds",
+      value: formatMoney(metrics?.refund_amount_minor.value, overview.data?.currency),
+      state: metrics?.refund_amount_minor.trust_state,
+      delta: `${formatPercent(metrics?.refund_rate.value)} of gross`,
+    },
+    {
+      label: "Churned",
+      value: formatNumber(metrics?.churned_subscriptions.value),
+      state: metrics?.churned_subscriptions.trust_state,
+      delta: "Period total",
+    },
+  ];
 
   return (
     <Page title="Overview" actions={<FilterBar filters={filters} onChange={setFilters} />}>
-      {overview.error ? <ErrorBlock error={overview.error} /> : null}
-      <section className="metric-grid">
-        <MetricCard label="Gross revenue" value={formatMoney(overview.data?.metrics.gross_revenue_minor.value, overview.data?.currency)} state={overview.data?.metrics.gross_revenue_minor.trust_state} />
-        <MetricCard label="Net revenue" value={formatMoney(overview.data?.metrics.net_revenue_minor.value, overview.data?.currency)} state={overview.data?.metrics.net_revenue_minor.trust_state} />
-        <MetricCard label="Active subscriptions" value={formatNumber(overview.data?.metrics.active_subscriptions.value)} state={overview.data?.metrics.active_subscriptions.trust_state} />
-        <MetricCard label="New subscriptions" value={formatNumber(overview.data?.metrics.new_subscriptions.value)} state={overview.data?.metrics.new_subscriptions.trust_state} />
-        <MetricCard label="Renewals" value={formatNumber(overview.data?.metrics.renewals.value)} state={overview.data?.metrics.renewals.trust_state} />
-        <MetricCard label="Refunds" value={formatMoney(overview.data?.metrics.refund_amount_minor.value, overview.data?.currency)} state={overview.data?.metrics.refund_amount_minor.trust_state} />
-        <MetricCard label="Refund rate" value={formatPercent(overview.data?.metrics.refund_rate.value)} state={overview.data?.metrics.refund_rate.trust_state} />
-        <MetricCard label="Churned" value={formatNumber(overview.data?.metrics.churned_subscriptions.value)} state={overview.data?.metrics.churned_subscriptions.trust_state} />
-      </section>
-      {overview.data?.warnings.length ? (
-        <Panel title="Metric notes">
-          <ul className="issue-list">
-            {overview.data.warnings.map((warning) => (
-              <li key={warning}>
-                <AlertTriangle size={16} />
-                <span>{warning}</span>
-              </li>
-            ))}
-          </ul>
-        </Panel>
-      ) : null}
-      <div className="two-column">
-        <Panel title="Revenue trend">
-          <ChartFrame>
-            <ResponsiveContainer width="100%" height={260}>
-              <LineChart data={series.data?.series ?? []}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="date" tickFormatter={formatDate} />
-                <YAxis tickFormatter={(value) => `$${Number(value) / 100}`} width={56} />
-                <Tooltip formatter={(value) => formatMoney(Number(value), overview.data?.currency)} labelFormatter={(value) => formatDate(String(value))} />
-                <Legend />
-                <Line dataKey="gross_revenue_minor" name="Gross" stroke="#0f766e" strokeWidth={2} dot={false} />
-                <Line dataKey="net_revenue_minor" name="Net" stroke="#334155" strokeWidth={2} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          </ChartFrame>
-        </Panel>
-        <Panel title="Setup state">
-          <div className="source-health-list">
-            {(sources.data?.data_sources ?? []).map((source) => (
-              <div className="source-health" key={source.id}>
+      <div className="overview-content">
+        {overview.error ? <ErrorBlock error={overview.error} /> : null}
+        <div className="overview-grid">
+          <Card className="overview-panel revenue-stage" variant="secondary">
+            <Card.Content className="revenue-stage__content">
+              <div className="stage-head">
                 <div>
-                  <strong>{source.name}</strong>
-                  <span>{titleize(source.source_type)} · {source.app_name ?? "No app"}</span>
+                  <span className="stage-kicker"><TrendingUp size={15} /> Gross revenue</span>
+                  <h2>{formatMoney(metrics?.gross_revenue_minor.value, overview.data?.currency)}</h2>
                 </div>
-                <StatusLabel value={source.status} />
+                <div className="stage-proof">
+                  <StatusLabel value={trustState} />
+                  <span>{formatDate(overview.data?.period.from)} – {formatDate(overview.data?.period.to)}</span>
+                </div>
               </div>
-            ))}
-            {!sources.data?.data_sources.length ? (
-              <EmptyState
-                icon={<RadioTower size={18} />}
-                title="No source connected"
-                action={<NavLink className="secondary-button" to="/sources"><Plus size={16} /> Add source</NavLink>}
-              />
-            ) : null}
-          </div>
-        </Panel>
+              <ChartFrame>
+                <ResponsiveContainer width="100%" height={288}>
+                  <LineChart data={revenueSeries} margin={{ top: 14, right: 18, bottom: 0, left: 0 }}>
+                    <CartesianGrid stroke="var(--separator)" strokeDasharray="2 6" vertical={false} />
+                    <XAxis dataKey="date" tickFormatter={formatDate} tickLine={false} axisLine={{ stroke: "var(--separator)" }} stroke="var(--muted)" />
+                    <YAxis tickFormatter={(value) => formatCompactMoney(Number(value), overview.data?.currency)} tickLine={false} axisLine={false} width={68} stroke="var(--muted)" />
+                    <Tooltip
+                      formatter={(value) => formatMoney(Number(value), overview.data?.currency)}
+                      labelFormatter={(value) => formatDate(String(value))}
+                      contentStyle={{ background: "var(--overlay)", border: "1px solid var(--separator)", borderRadius: 12, color: "var(--overlay-foreground)" }}
+                      labelStyle={{ color: "var(--accent)" }}
+                    />
+                    <Line dataKey="gross_revenue_minor" name="Gross" stroke="var(--accent)" strokeWidth={2.4} dot={false} activeDot={{ r: 4, fill: "var(--accent)" }} isAnimationActive={false} />
+                    <Line dataKey="net_revenue_minor" name="Net" stroke="var(--success)" strokeWidth={1.7} dot={false} isAnimationActive={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </ChartFrame>
+              <div className="stage-ledger-grid">
+                {supportingMetrics.map((metric) => (
+                  <OverviewMetric key={metric.label} {...metric} />
+                ))}
+              </div>
+            </Card.Content>
+          </Card>
+          <aside className="overview-side" aria-label="Revenue evidence">
+            <Card className="overview-panel source-ledger" variant="secondary">
+              <Card.Header className="overview-panel-head">
+                <Card.Title>Source health</Card.Title>
+                <AppLink to="/sources">View all <ArrowUpRight size={14} /></AppLink>
+              </Card.Header>
+              <Card.Content className="source-ledger-table">
+                {sourceRows.slice(0, 6).map((source) => (
+                  <div className="source-ledger-row" key={source.id}>
+                    <div>
+                      <strong>{source.name}</strong>
+                      <span>{titleize(source.source_type)} · {source.app_name ?? "No app"}</span>
+                    </div>
+                    <StatusLabel value={source.status} />
+                    <span className="last-sync">{formatDateTime(source.last_sync_at ?? source.last_event_at ?? source.updated_at)}</span>
+                  </div>
+                ))}
+                {!sourceRows.length ? (
+                  <EmptyState
+                    icon={<RadioTower size={18} />}
+                    title="No source connected"
+                    action={<AppLink to="/sources"><Plus size={16} /> Add source</AppLink>}
+                  />
+                ) : null}
+              </Card.Content>
+            </Card>
+            <Card className="overview-panel reconciliation-card" variant="secondary">
+              <Card.Header className="overview-panel-head">
+                <Card.Title>Reconciliation</Card.Title>
+                <ShieldCheck size={17} />
+              </Card.Header>
+              <Card.Content className="reconciliation-card__content">
+                <dl className="reconciliation-list">
+                  <div>
+                    <dt>Trust state</dt>
+                    <dd><StatusLabel value={warningCount || sourceIssueCount || unmappedCount ? "estimated" : trustState} /></dd>
+                  </div>
+                  <div>
+                    <dt>Metric notes</dt>
+                    <dd>{formatNumber(warningCount)}</dd>
+                  </div>
+                  <div>
+                    <dt>Unmapped products</dt>
+                    <dd>{formatNumber(unmappedCount)}</dd>
+                  </div>
+                  <div>
+                    <dt>Source issues</dt>
+                    <dd>{formatNumber(sourceIssueCount)}</dd>
+                  </div>
+                </dl>
+                {overview.data?.warnings.length ? (
+                  <ul className="issue-list compact-issues">
+                    {overview.data.warnings.slice(0, 3).map((warning) => (
+                      <li key={warning}>
+                        <AlertTriangle size={15} />
+                        <span>{warning}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="quiet-copy">No blocking metric issues detected for this range.</p>
+                )}
+              </Card.Content>
+            </Card>
+          </aside>
+        </div>
+        <Card className="overview-panel overview-ledger" variant="secondary">
+          <Card.Header className="overview-panel-head">
+            <Card.Title>Recent transactions</Card.Title>
+            {!transactions.data?.transactions.length ? (
+              <Button isDisabled={seed.isPending} onPress={() => seed.mutate()} size="sm" variant="secondary">
+                <Plus size={16} />
+                Seed demo
+              </Button>
+            ) : (
+              <AppLink to="/transactions">View all transactions <ArrowUpRight size={14} /></AppLink>
+            )}
+          </Card.Header>
+          <Card.Content className="overview-ledger__content">
+            <TransactionTable transactions={(transactions.data?.transactions ?? []).slice(0, 8)} compact />
+          </Card.Content>
+        </Card>
       </div>
-      <Panel
-        title="Recent transactions"
-        actions={
-          !transactions.data?.transactions.length ? (
-            <button className="secondary-button" onClick={() => seed.mutate()} disabled={seed.isPending}>
-              <Plus size={16} />
-              Seed demo
-            </button>
-          ) : null
-        }
-      >
-        <TransactionTable transactions={(transactions.data?.transactions ?? []).slice(0, 8)} compact />
-      </Panel>
     </Page>
+  );
+}
+
+function OverviewMetric({ delta, label, state, value }: { delta: string; label: string; state?: string; value: string }) {
+  return (
+    <div className="overview-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <div>
+        <StatusLabel value={state ?? "estimated"} />
+        <small>{delta}</small>
+      </div>
+    </div>
   );
 }
 
@@ -345,11 +476,11 @@ function RevenuePage() {
             <BarChart data={series.data?.series ?? []}>
               <CartesianGrid strokeDasharray="3 3" vertical={false} />
               <XAxis dataKey="date" tickFormatter={formatDate} />
-              <YAxis tickFormatter={(value) => `$${Number(value) / 100}`} />
+              <YAxis tickFormatter={(value) => formatCompactMoney(Number(value), filters.currency)} />
               <Tooltip formatter={(value) => formatMoney(Number(value), filters.currency)} labelFormatter={(value) => formatDate(String(value))} />
               <Legend />
-              <Bar dataKey="gross_revenue_minor" name="Gross" fill="#0f766e" />
-              <Bar dataKey="refund_amount_minor" name="Refunds" fill="#dc2626" />
+              <Bar dataKey="gross_revenue_minor" name="Gross" fill="var(--accent)" isAnimationActive={false} />
+              <Bar dataKey="refund_amount_minor" name="Refunds" fill="var(--danger)" isAnimationActive={false} />
             </BarChart>
           </ResponsiveContainer>
         </ChartFrame>
@@ -360,26 +491,24 @@ function RevenuePage() {
           <Segmented value={by} onChange={setBy} options={["product", "app", "platform", "country", "source"]} />
         }
       >
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>{titleize(by)}</th>
-              <th>Gross</th>
-              <th>Refunds</th>
-              <th>Transactions</th>
-            </tr>
-          </thead>
-          <tbody>
+        <DataTable ariaLabel="Revenue breakdown">
+          <Table.Header>
+            <Table.Column isRowHeader>{titleize(by)}</Table.Column>
+            <Table.Column>Gross</Table.Column>
+            <Table.Column>Refunds</Table.Column>
+            <Table.Column>Transactions</Table.Column>
+          </Table.Header>
+          <Table.Body>
             {(breakdown.data?.items ?? []).map((item) => (
-              <tr key={item.label}>
-                <td>{item.label}</td>
-                <td>{formatMoney(item.gross_revenue_minor, filters.currency)}</td>
-                <td>{formatMoney(item.refund_amount_minor, filters.currency)}</td>
-                <td>{formatNumber(item.transaction_count)}</td>
-              </tr>
+              <Table.Row id={item.label} key={item.label}>
+                <Table.Cell>{item.label}</Table.Cell>
+                <Table.Cell>{formatMoney(item.gross_revenue_minor, filters.currency)}</Table.Cell>
+                <Table.Cell>{formatMoney(item.refund_amount_minor, filters.currency)}</Table.Cell>
+                <Table.Cell>{formatNumber(item.transaction_count)}</Table.Cell>
+              </Table.Row>
             ))}
-          </tbody>
-        </table>
+          </Table.Body>
+        </DataTable>
       </Panel>
     </Page>
   );
@@ -388,50 +517,109 @@ function RevenuePage() {
 function TransactionsPage() {
   const [filters, setFilters] = useDashboardFilters();
   const [status, setStatus] = useState("all");
+  const [environment, setEnvironment] = useState("all");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const transactions = useQuery({
-    queryKey: ["transactions", filters, status],
-    queryFn: () => api.transactions({ ...filters, status }),
+    queryKey: ["transactions", filters, status, environment],
+    queryFn: () => api.transactions({ ...filters, status, environment }),
+  });
+  const detail = useQuery({
+    queryKey: ["transaction", selectedId],
+    queryFn: () => api.transaction(selectedId!),
+    enabled: Boolean(selectedId),
   });
   return (
     <Page
       title="Transactions"
       actions={
-        <div className="toolbar">
+        <Toolbar className="toolbar" aria-label="Transaction filters">
           <FilterBar filters={filters} onChange={setFilters} compact />
-          <select value={status} onChange={(event) => setStatus(event.target.value)}>
-            <option value="all">All statuses</option>
-            <option value="paid">Paid</option>
-            <option value="renewed">Renewed</option>
-            <option value="refunded">Refunded</option>
-            <option value="revoked">Revoked</option>
-          </select>
-        </div>
+          <SelectControl
+            ariaLabel="Transaction status"
+            value={status}
+            onChange={setStatus}
+            options={[
+              { value: "all", label: "All statuses" },
+              { value: "paid", label: "Paid" },
+              { value: "renewed", label: "Renewed" },
+              { value: "refunded", label: "Refunded" },
+              { value: "revoked", label: "Revoked" },
+            ]}
+          />
+          <SelectControl
+            ariaLabel="Transaction environment"
+            value={environment}
+            onChange={setEnvironment}
+            options={[
+              { value: "all", label: "All environments" },
+              { value: "production", label: "Production" },
+              { value: "sandbox", label: "Apple sandbox" },
+              { value: "test", label: "Test purchases" },
+              { value: "unknown", label: "Unverified" },
+            ]}
+          />
+        </Toolbar>
       }
     >
       <Panel title="Ledger">
         {transactions.error ? <ErrorBlock error={transactions.error} /> : null}
-        <TransactionTable transactions={transactions.data?.transactions ?? []} />
+        <TransactionTable transactions={transactions.data?.transactions ?? []} onSelect={setSelectedId} />
       </Panel>
+      {selectedId ? (
+        <EvidenceDrawer
+          title={detail.data?.transaction.transaction_key ?? "Transaction evidence"}
+          subtitle={detail.data ? `${detail.data.transaction.logical_product_name ?? detail.data.transaction.source_product_name ?? "Unmapped"} · ${formatMoney(detail.data.transaction.amount_minor, detail.data.transaction.currency)}` : undefined}
+          events={detail.data?.events ?? []}
+          error={detail.error}
+          loading={detail.isLoading}
+          onClose={() => setSelectedId(null)}
+        />
+      ) : null}
     </Page>
   );
 }
 
 function SubscriptionsPage() {
+  const [filters, setFilters] = useDashboardFilters();
   const [status, setStatus] = useState("all");
-  const subscriptions = useQuery({ queryKey: ["subscriptions", status], queryFn: () => api.subscriptions({ status }) });
-  const subSeries = useQuery({ queryKey: ["subscription-series"], queryFn: () => api.subscriptionTimeseries({}) });
+  const [environment, setEnvironment] = useState("production");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const subscriptions = useQuery({ queryKey: ["subscriptions", filters, status, environment], queryFn: () => api.subscriptions({ ...filters, status, environment }) });
+  const subSeries = useQuery({ queryKey: ["subscription-series", filters], queryFn: () => api.subscriptionTimeseries(filters) });
+  const detail = useQuery({ queryKey: ["subscription", selectedId], queryFn: () => api.subscription(selectedId!), enabled: Boolean(selectedId) });
   return (
     <Page
       title="Subscriptions"
       actions={
-        <select value={status} onChange={(event) => setStatus(event.target.value)}>
-          <option value="all">All statuses</option>
-          <option value="trialing">Trialing</option>
-          <option value="active">Active</option>
-          <option value="cancelled_active">Cancelled active</option>
-          <option value="billing_retry">Billing retry</option>
-          <option value="expired">Expired</option>
-        </select>
+        <Toolbar className="toolbar" aria-label="Subscription filters">
+          <FilterBar filters={filters} onChange={setFilters} compact />
+          <SelectControl
+            ariaLabel="Subscription status"
+            value={status}
+            onChange={setStatus}
+            options={[
+              { value: "all", label: "All statuses" },
+              { value: "trialing", label: "Trialing" },
+              { value: "active", label: "Active" },
+              { value: "cancelled_active", label: "Cancelled active" },
+              { value: "grace_period", label: "Grace period" },
+              { value: "billing_retry", label: "Billing retry" },
+              { value: "expired", label: "Expired" },
+            ]}
+          />
+          <SelectControl
+            ariaLabel="Subscription environment"
+            value={environment}
+            onChange={setEnvironment}
+            options={[
+              { value: "all", label: "All environments" },
+              { value: "production", label: "Production" },
+              { value: "sandbox", label: "Apple sandbox" },
+              { value: "test", label: "Test purchases" },
+              { value: "unknown", label: "Unverified" },
+            ]}
+          />
+        </Toolbar>
       }
     >
       <Panel title="Subscription movement">
@@ -443,39 +631,50 @@ function SubscriptionsPage() {
               <YAxis />
               <Tooltip labelFormatter={(value) => formatDate(String(value))} />
               <Legend />
-              <Line dataKey="new_subscription_count" name="New" stroke="#0f766e" strokeWidth={2} dot={false} />
-              <Line dataKey="renewal_count" name="Renewals" stroke="#475569" strokeWidth={2} dot={false} />
-              <Line dataKey="cancel_count" name="Cancels" stroke="#b45309" strokeWidth={2} dot={false} />
+              <Line dataKey="new_subscription_count" name="New" stroke="var(--success)" strokeWidth={2} dot={false} isAnimationActive={false} />
+              <Line dataKey="renewal_count" name="Renewals" stroke="var(--accent)" strokeWidth={2} dot={false} isAnimationActive={false} />
+              <Line dataKey="cancel_count" name="Cancels" stroke="var(--warning)" strokeWidth={2} dot={false} isAnimationActive={false} />
             </LineChart>
           </ResponsiveContainer>
         </ChartFrame>
       </Panel>
       <Panel title="Current subscriptions">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Subscription</th>
-              <th>Product</th>
-              <th>Platform</th>
-              <th>Status</th>
-              <th>Started</th>
-              <th>Renewal</th>
-            </tr>
-          </thead>
-          <tbody>
+        <DataTable ariaLabel="Current subscriptions">
+          <Table.Header>
+            <Table.Column isRowHeader>Subscription</Table.Column>
+            <Table.Column>Product</Table.Column>
+            <Table.Column>Platform</Table.Column>
+            <Table.Column>Environment</Table.Column>
+            <Table.Column>Status</Table.Column>
+            <Table.Column>Started</Table.Column>
+            <Table.Column>Renewal</Table.Column>
+          </Table.Header>
+          <Table.Body>
             {(subscriptions.data?.subscriptions ?? []).map((subscription) => (
-              <tr key={subscription.id}>
-                <td className="mono-cell">{subscription.subscription_key}</td>
-                <td>{subscription.logical_product_name ?? subscription.source_product_name ?? "Unmapped"}</td>
-                <td>{titleize(subscription.platform)}</td>
-                <td><StatusLabel value={subscription.status} /></td>
-                <td>{formatDateTime(subscription.started_at)}</td>
-                <td>{subscription.will_renew ? "Will renew" : "Won't renew"}</td>
-              </tr>
+              <Table.Row className="click-row" id={subscription.id} key={subscription.id} onAction={() => setSelectedId(subscription.id)}>
+                <Table.Cell className="mono-cell">{subscription.subscription_key}</Table.Cell>
+                <Table.Cell>{subscription.logical_product_name ?? subscription.source_product_name ?? "Unmapped"}</Table.Cell>
+                <Table.Cell>{titleize(subscription.platform)}</Table.Cell>
+                <Table.Cell><StatusLabel value={subscription.environment} /></Table.Cell>
+                <Table.Cell><StatusLabel value={subscription.status} /></Table.Cell>
+                <Table.Cell>{formatDateTime(subscription.started_at)}</Table.Cell>
+                <Table.Cell>{subscription.will_renew ? "Will renew" : "Won't renew"}</Table.Cell>
+              </Table.Row>
             ))}
-          </tbody>
-        </table>
+          </Table.Body>
+        </DataTable>
       </Panel>
+      {selectedId ? (
+        <EvidenceDrawer
+          title={detail.data?.subscription.subscription_key ?? "Subscription evidence"}
+          subtitle={detail.data ? `${detail.data.subscription.logical_product_name ?? detail.data.subscription.source_product_name ?? "Unmapped"} · ${titleize(detail.data.subscription.status)}` : undefined}
+          events={detail.data?.timeline ?? []}
+          error={detail.error}
+          loading={detail.isLoading}
+          onClose={() => setSelectedId(null)}
+          subscription={detail.data?.subscription}
+        />
+      ) : null}
     </Page>
   );
 }
@@ -540,19 +739,27 @@ function ProductsPage() {
     <Page
       title="Products"
       actions={
-        <div className="toolbar">
-          <select value={selectedAppId} onChange={(event) => setSelectedAppId(event.target.value)}>
-            {apps.data?.apps.map((app) => <option key={app.id} value={app.id}>{app.name}</option>)}
-          </select>
-          <button className="secondary-button" onClick={() => setDrafts(buildCatalogDraft(unmapped))}>
+        <Toolbar className="toolbar" aria-label="Product catalog actions">
+          <SelectControl
+            ariaLabel="Catalog app"
+            value={selectedAppId}
+            onChange={setSelectedAppId}
+            options={(apps.data?.apps ?? []).map((app) => ({ value: app.id, label: app.name }))}
+          />
+          <Button onPress={() => setDrafts(buildCatalogDraft(unmapped))} size="sm" variant="secondary">
             <RefreshCw size={16} />
             Regenerate draft
-          </button>
-          <button className="primary-button" onClick={() => confirm.mutate()} disabled={!selectedAppId || confirm.isPending || (!drafts.length && !ignored.size)}>
+          </Button>
+          <Button
+            isDisabled={!selectedAppId || confirm.isPending || (!drafts.length && !ignored.size)}
+            onPress={() => confirm.mutate()}
+            size="sm"
+            variant="primary"
+          >
             <Check size={16} />
             Confirm catalog
-          </button>
-        </div>
+          </Button>
+        </Toolbar>
       }
     >
       {confirm.error ? <ErrorBlock error={confirm.error} /> : null}
@@ -562,58 +769,74 @@ function ProductsPage() {
         ) : (
           <div className="draft-list">
             {drafts.map((draft, index) => (
-              <div className="draft-item" key={draft.client_id}>
-                <div className="draft-form-grid">
-                  <Field label="Product name">
-                    <input value={draft.display_name} onChange={(event) => updateDraft(setDrafts, index, { display_name: event.target.value })} />
-                  </Field>
-                  <Field label="Kind">
-                    <select value={draft.product_kind} onChange={(event) => updateDraft(setDrafts, index, { product_kind: event.target.value })}>
-                      <option value="subscription">Subscription</option>
-                      <option value="consumable">Consumable</option>
-                      <option value="non_consumable">Non-consumable</option>
-                      <option value="lifetime">Lifetime</option>
-                      <option value="unknown">Unknown</option>
-                    </select>
-                  </Field>
-                  <Field label="Period">
-                    <select value={draft.billing_period} onChange={(event) => updateDraft(setDrafts, index, { billing_period: event.target.value })}>
-                      <option value="weekly">Weekly</option>
-                      <option value="monthly">Monthly</option>
-                      <option value="annual">Annual</option>
-                      <option value="lifetime">Lifetime</option>
-                      <option value="none">None</option>
-                      <option value="unknown">Unknown</option>
-                    </select>
-                  </Field>
-                  <Field label="Category">
-                    <input value={draft.reporting_category} onChange={(event) => updateDraft(setDrafts, index, { reporting_category: event.target.value })} />
-                  </Field>
-                </div>
-                <span className="muted">{draft.reason}</span>
-                <div className="source-product-list">
-                  {draft.source_product_ids.map((id) => {
-                    const product = unmapped.find((item) => item.id === id);
-                    if (!product) return null;
-                    return (
-                      <label className="source-product-row" key={id}>
-                        <input
-                          type="checkbox"
-                          checked={!ignored.has(id)}
-                          onChange={(event) => {
+              <section className="draft-item" key={draft.client_id}>
+                <div className="draft-item__content">
+                  <div className="draft-form-grid">
+                    <Field label="Product name">
+                      <Input fullWidth value={draft.display_name} onChange={(event) => updateDraft(setDrafts, index, { display_name: event.target.value })} variant="secondary" />
+                    </Field>
+                    <Field label="Kind">
+                      <SelectControl
+                        ariaLabel="Product kind"
+                        value={draft.product_kind}
+                        onChange={(value) => updateDraft(setDrafts, index, { product_kind: value })}
+                        options={[
+                          { value: "subscription", label: "Subscription" },
+                          { value: "consumable", label: "Consumable" },
+                          { value: "non_consumable", label: "Non-consumable" },
+                          { value: "lifetime", label: "Lifetime" },
+                          { value: "unknown", label: "Unknown" },
+                        ]}
+                      />
+                    </Field>
+                    <Field label="Period">
+                      <SelectControl
+                        ariaLabel="Billing period"
+                        value={draft.billing_period}
+                        onChange={(value) => updateDraft(setDrafts, index, { billing_period: value })}
+                        options={[
+                          { value: "weekly", label: "Weekly" },
+                          { value: "monthly", label: "Monthly" },
+                          { value: "annual", label: "Annual" },
+                          { value: "lifetime", label: "Lifetime" },
+                          { value: "none", label: "None" },
+                          { value: "unknown", label: "Unknown" },
+                        ]}
+                      />
+                    </Field>
+                    <Field label="Category">
+                      <Input fullWidth value={draft.reporting_category} onChange={(event) => updateDraft(setDrafts, index, { reporting_category: event.target.value })} variant="secondary" />
+                    </Field>
+                  </div>
+                  <span className="muted">{draft.reason}</span>
+                  <div className="source-product-list">
+                    {draft.source_product_ids.map((id) => {
+                      const product = unmapped.find((item) => item.id === id);
+                      if (!product) return null;
+                      return (
+                        <Checkbox
+                          className="source-product-row"
+                          isSelected={!ignored.has(id)}
+                          key={id}
+                          onChange={(checked) => {
                             const next = new Set(ignored);
-                            if (event.target.checked) next.delete(id);
+                            if (checked) next.delete(id);
                             else next.add(id);
                             setIgnored(next);
                           }}
-                        />
-                        <span>{product.external_product_id ?? product.display_name ?? id}</span>
-                        <span>{titleize(product.source_type)} · {titleize(product.product_kind)} · {titleize(product.billing_period)}</span>
-                      </label>
-                    );
-                  })}
+                          variant="secondary"
+                        >
+                          <Checkbox.Content className="source-product-row__content">
+                            <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                            <span className="source-product-name">{product.external_product_id ?? product.display_name ?? id}</span>
+                            <span className="source-product-meta">{titleize(product.source_type)} · {titleize(product.product_kind)} · {titleize(product.billing_period)}</span>
+                          </Checkbox.Content>
+                        </Checkbox>
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
+              </section>
             ))}
           </div>
         )}
@@ -636,69 +859,77 @@ function EventsPage() {
     <Page
       title="Events"
       actions={
-        <div className="toolbar">
+        <Toolbar className="toolbar" aria-label="Event filters">
           <Segmented value={tab} onChange={(value) => setTab(value as "raw" | "normalized")} options={["raw", "normalized"]} />
-          <label className="search-box">
+          <div className="search-control">
             <Search size={16} />
-            <input value={q} onChange={(event) => setQ(event.target.value)} placeholder="Search raw payloads" disabled={tab !== "raw"} />
-          </label>
-        </div>
+            <Input
+              aria-label="Search raw payloads"
+              className="search-input"
+              disabled={tab !== "raw"}
+              onChange={(event) => setQ(event.target.value)}
+              placeholder="Search raw payloads"
+              value={q}
+              variant="secondary"
+            />
+          </div>
+        </Toolbar>
       }
     >
       {tab === "raw" ? (
         <Panel title="Raw events">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Received</th>
-                <th>Source</th>
-                <th>Event</th>
-                <th>Product</th>
-                <th>Status</th>
-                <th>Signature</th>
-              </tr>
-            </thead>
-            <tbody>
+          <DataTable ariaLabel="Raw events">
+            <Table.Header>
+              <Table.Column isRowHeader>Received</Table.Column>
+              <Table.Column>Source</Table.Column>
+              <Table.Column>Event</Table.Column>
+              <Table.Column>Environment</Table.Column>
+              <Table.Column>Product</Table.Column>
+              <Table.Column>Status</Table.Column>
+              <Table.Column>Signature</Table.Column>
+            </Table.Header>
+            <Table.Body>
               {(raw.data?.raw_events ?? []).map((event) => (
-                <tr key={event.id} onClick={() => setSelected(event)} className="click-row">
-                  <td>{formatDateTime(event.received_at)}</td>
-                  <td>{titleize(event.source_type)}</td>
-                  <td>{event.source_event_type ?? event.source_event_id}</td>
-                  <td>{event.source_product_name ?? event.source_product_id ?? "—"}</td>
-                  <td><StatusLabel value={event.processing_status} /></td>
-                  <td>{event.signature_verified ? "Verified" : "Stored"}</td>
-                </tr>
+                <Table.Row className="click-row" id={event.id} key={event.id} onAction={() => setSelected(event)}>
+                  <Table.Cell>{formatDateTime(event.received_at)}</Table.Cell>
+                  <Table.Cell>{titleize(event.source_type)}</Table.Cell>
+                  <Table.Cell>{event.source_event_type ?? event.source_event_id}</Table.Cell>
+                  <Table.Cell><StatusLabel value={event.environment} /></Table.Cell>
+                  <Table.Cell>{event.source_product_name ?? event.source_product_id ?? "—"}</Table.Cell>
+                  <Table.Cell><StatusLabel value={event.processing_status} /></Table.Cell>
+                  <Table.Cell>{event.signature_verified ? "Verified" : "Stored"}</Table.Cell>
+                </Table.Row>
               ))}
-            </tbody>
-          </table>
+            </Table.Body>
+          </DataTable>
           {selected ? <JsonDrawer title={selected.source_event_id} value={selected.payload} onClose={() => setSelected(null)} /> : null}
         </Panel>
       ) : (
         <Panel title="Normalized events">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Type</th>
-                <th>Product</th>
-                <th>Transaction</th>
-                <th>Amount</th>
-                <th>Confidence</th>
-              </tr>
-            </thead>
-            <tbody>
+          <DataTable ariaLabel="Normalized events">
+            <Table.Header>
+              <Table.Column isRowHeader>Time</Table.Column>
+              <Table.Column>Type</Table.Column>
+              <Table.Column>Environment</Table.Column>
+              <Table.Column>Product</Table.Column>
+              <Table.Column>Transaction</Table.Column>
+              <Table.Column>Amount</Table.Column>
+              <Table.Column>Confidence</Table.Column>
+            </Table.Header>
+            <Table.Body>
               {(normalized.data?.normalized_events ?? []).map((event) => (
-                <tr key={event.id}>
-                  <td>{formatDateTime(event.occurred_at)}</td>
-                  <td>{titleize(event.event_type)}</td>
-                  <td>{event.logical_product_name ?? event.source_product_name ?? "Unmapped"}</td>
-                  <td className="mono-cell">{event.transaction_key ?? "—"}</td>
-                  <td>{formatMoney(event.amount_minor, event.currency ?? "USD")}</td>
-                  <td>{Math.round(event.confidence * 100)}%</td>
-                </tr>
+                <Table.Row id={event.id} key={event.id}>
+                  <Table.Cell>{formatDateTime(event.occurred_at)}</Table.Cell>
+                  <Table.Cell>{titleize(event.event_type)}</Table.Cell>
+                  <Table.Cell><StatusLabel value={event.environment} /></Table.Cell>
+                  <Table.Cell>{event.logical_product_name ?? event.source_product_name ?? "Unmapped"}</Table.Cell>
+                  <Table.Cell className="mono-cell">{event.transaction_key ?? "—"}</Table.Cell>
+                  <Table.Cell>{formatMoney(event.amount_minor, event.currency ?? "USD")}</Table.Cell>
+                  <Table.Cell>{Math.round(event.confidence * 100)}%</Table.Cell>
+                </Table.Row>
               ))}
-            </tbody>
-          </table>
+            </Table.Body>
+          </DataTable>
         </Panel>
       )}
     </Page>
@@ -817,36 +1048,34 @@ function JobsPage() {
   return (
     <Page title="Jobs">
       <Panel title="Queue">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Created</th>
-              <th>Type</th>
-              <th>Status</th>
-              <th>Attempts</th>
-              <th>Error</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
+        <DataTable ariaLabel="Jobs queue">
+          <Table.Header>
+            <Table.Column isRowHeader>Created</Table.Column>
+            <Table.Column>Type</Table.Column>
+            <Table.Column>Status</Table.Column>
+            <Table.Column>Attempts</Table.Column>
+            <Table.Column>Error</Table.Column>
+            <Table.Column>Action</Table.Column>
+          </Table.Header>
+          <Table.Body>
             {(jobs.data?.jobs ?? []).map((job) => (
-              <tr key={job.id}>
-                <td>{formatDateTime(job.created_at)}</td>
-                <td>{job.job_type}</td>
-                <td><StatusLabel value={job.status} /></td>
-                <td>{job.attempts}/{job.max_attempts}</td>
-                <td>{job.last_error ?? "—"}</td>
-                <td>
+              <Table.Row id={job.id} key={job.id}>
+                <Table.Cell>{formatDateTime(job.created_at)}</Table.Cell>
+                <Table.Cell>{job.job_type}</Table.Cell>
+                <Table.Cell><StatusLabel value={job.status} /></Table.Cell>
+                <Table.Cell>{job.attempts}/{job.max_attempts}</Table.Cell>
+                <Table.Cell>{job.last_error ?? "—"}</Table.Cell>
+                <Table.Cell>
                   {["failed", "dead"].includes(job.status) ? (
-                    <button className="icon-button" onClick={() => retry.mutate(job.id)} title="Retry job">
+                    <Button aria-label="Retry job" isIconOnly onPress={() => retry.mutate(job.id)} size="sm" variant="secondary">
                       <RefreshCw size={16} />
-                    </button>
+                    </Button>
                   ) : null}
-                </td>
-              </tr>
+                </Table.Cell>
+              </Table.Row>
             ))}
-          </tbody>
-        </table>
+          </Table.Body>
+        </DataTable>
       </Panel>
     </Page>
   );
@@ -864,33 +1093,31 @@ function SettingsPage() {
       <div className="two-column align-start">
         <Panel title="Apps">
           <AppForm onSubmit={(input) => createApp.mutate(input)} pending={createApp.isPending} error={createApp.error} />
-          <table className="data-table compact-table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Apple bundle</th>
-                <th>Google package</th>
-                <th>Currency</th>
-              </tr>
-            </thead>
-            <tbody>
+          <DataTable ariaLabel="Apps" compact>
+            <Table.Header>
+              <Table.Column isRowHeader>Name</Table.Column>
+              <Table.Column>Apple bundle</Table.Column>
+              <Table.Column>Google package</Table.Column>
+              <Table.Column>Currency</Table.Column>
+            </Table.Header>
+            <Table.Body>
               {(apps.data?.apps ?? []).map((app) => (
-                <tr key={app.id}>
-                  <td>{app.name}</td>
-                  <td className="mono-cell">{app.apple_bundle_id ?? "—"}</td>
-                  <td className="mono-cell">{app.google_package_name ?? "—"}</td>
-                  <td>{app.default_currency ?? "—"}</td>
-                </tr>
+                <Table.Row id={app.id} key={app.id}>
+                  <Table.Cell>{app.name}</Table.Cell>
+                  <Table.Cell className="mono-cell">{app.apple_bundle_id ?? "—"}</Table.Cell>
+                  <Table.Cell className="mono-cell">{app.google_package_name ?? "—"}</Table.Cell>
+                  <Table.Cell>{app.default_currency ?? "—"}</Table.Cell>
+                </Table.Row>
               ))}
-            </tbody>
-          </table>
+            </Table.Body>
+          </DataTable>
         </Panel>
         <Panel title="Local data">
           <div className="settings-actions">
-            <a className="secondary-button" href={`${API_BASE_URL}/api/export/transactions.csv`}>
+            <Link href={`${API_BASE_URL}/api/export/transactions.csv`}>
               <Database size={16} />
               Export transactions CSV
-            </a>
+            </Link>
           </div>
           <p className="muted">Webhook secrets are stored as hashes. Raw payload access is limited to the owner session.</p>
         </Panel>
@@ -946,52 +1173,60 @@ function SourceForm({
   return (
     <form className="stack" onSubmit={submit}>
       <Field label="Source type">
-        <select
+        <SelectControl
+          ariaLabel="Source type"
           value={sourceType}
-          onChange={(event) => {
-            const next = event.target.value;
+          onChange={(next) => {
             setSourceType(next);
             setName(defaultSourceName(next));
             setCatchUpText("");
             setParseError(null);
           }}
-        >
-          <option value="revenuecat">RevenueCat</option>
-          <option value="custom_api">Custom API</option>
-          <option value="app_store">App Store</option>
-          <option value="google_play">Google Play</option>
-          <option value="stripe">Stripe</option>
-          <option value="paddle">Paddle</option>
-        </select>
+          options={[
+            { value: "revenuecat", label: "RevenueCat" },
+            { value: "custom_api", label: "Custom API" },
+            { value: "app_store", label: "App Store" },
+            { value: "google_play", label: "Google Play" },
+            { value: "stripe", label: "Stripe" },
+            { value: "paddle", label: "Paddle" },
+          ]}
+        />
       </Field>
       <Field label="Name">
-        <input value={name} onChange={(event) => setName(event.target.value)} required />
+        <Input fullWidth value={name} onChange={(event) => setName(event.target.value)} required variant="secondary" />
       </Field>
       <Field label="App">
-        <select value={appId} onChange={(event) => setAppId(event.target.value)}>
-          <option value="">No app</option>
-          {apps.map((app) => <option key={app.id} value={app.id}>{app.name}</option>)}
-        </select>
+        <SelectControl
+          ariaLabel="Source app"
+          value={appId}
+          onChange={setAppId}
+          options={[
+            { value: "", label: "No app" },
+            ...apps.map((app) => ({ value: app.id, label: app.name })),
+          ]}
+        />
       </Field>
       <Field label="Webhook secret">
-        <input value={secret} onChange={(event) => setSecret(event.target.value)} placeholder="Optional shared secret" />
+        <Input fullWidth value={secret} onChange={(event) => setSecret(event.target.value)} placeholder="Optional shared secret" variant="secondary" />
       </Field>
       {supportsCatchUp(sourceType) ? (
-        <Field label="Catch-up credentials JSON (optional)">
-          <textarea
+        <Field label="Source credentials and verification JSON">
+          <TextArea
+            fullWidth
             value={catchUpText}
             onChange={(event) => setCatchUpText(event.target.value)}
             placeholder={catchUpTemplate(sourceType)}
             rows={7}
+            variant="secondary"
           />
         </Field>
       ) : null}
       {parseError ? <p className="form-error">{parseError}</p> : null}
       {error ? <ErrorBlock error={error} /> : null}
-      <button className="primary-button" disabled={pending || !name}>
+      <Button isDisabled={pending || !name} size="sm" type="submit" variant="primary">
         <Plus size={16} />
         Add source
-      </button>
+      </Button>
     </form>
   );
 }
@@ -1044,85 +1279,93 @@ function SourceCard({
   }, [configureError, configurePending, source.has_credentials]);
 
   return (
-    <article className="source-card">
-      <div className="source-card-head">
+    <section className="source-card">
+      <header className="source-card-head">
         <div>
           <strong>{source.name}</strong>
           <span>{titleize(source.source_type)} · {source.app_name ?? "No app selected"}</span>
+          <span>Webhook verification: {source.verification_mode === "missing" ? "Not configured" : titleize(source.verification_mode)}</span>
         </div>
         <StatusLabel value={source.status} />
-      </div>
-      <div className="webhook-row">
-        <code>{source.webhook_url}</code>
-        <button
-          className="icon-button"
-          title="Copy webhook URL"
-          onClick={async () => {
-            await navigator.clipboard.writeText(source.webhook_url);
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 1200);
-          }}
-        >
-          {copied ? <Check size={16} /> : <Copy size={16} />}
-        </button>
-      </div>
-      <ul className="check-list">
-        {source.setup_checklist.map((item) => (
-          <li key={item.key}>
-            {item.done ? <Check size={15} /> : <X size={15} />}
-            <span>{item.label}</span>
-          </li>
-        ))}
-      </ul>
-      <div className="card-actions">
-        <button className="secondary-button" onClick={onTest}>
-          <RefreshCw size={16} />
-          Test
-        </button>
-        {onConfigureCatchUp ? (
-          <button
-            className="secondary-button"
-            onClick={() => {
-              setEditingCredentials((current) => !current);
-              setCredentialsParseError(null);
+      </header>
+      <div className="source-card__content">
+        <div className="webhook-row">
+          <code>{source.webhook_url}</code>
+          <Button
+            aria-label="Copy webhook URL"
+            isIconOnly
+            onPress={async () => {
+              await navigator.clipboard.writeText(source.webhook_url);
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1200);
             }}
+            size="sm"
+            variant="secondary"
           >
-            <KeyRound size={16} />
-            Configure
-          </button>
+            {copied ? <Check size={16} /> : <Copy size={16} />}
+          </Button>
+        </div>
+        <ul className="check-list">
+          {source.setup_checklist.map((item) => (
+            <li key={item.key}>
+              {item.done ? <Check size={15} /> : <X size={15} />}
+              <span>{item.label}</span>
+            </li>
+          ))}
+        </ul>
+        <div className="card-actions">
+          <Button onPress={onTest} size="sm" variant="secondary">
+            <RefreshCw size={16} />
+            Test
+          </Button>
+          {onConfigureCatchUp ? (
+            <Button
+              onPress={() => {
+                setEditingCredentials((current) => !current);
+                setCredentialsParseError(null);
+              }}
+              size="sm"
+              variant="secondary"
+            >
+              <KeyRound size={16} />
+              Configure
+            </Button>
+          ) : null}
+          {onCatchUp ? (
+            <Button onPress={onCatchUp} size="sm" variant="secondary">
+              <CloudDownload size={16} />
+              Catch up
+            </Button>
+          ) : null}
+        </div>
+        {editingCredentials && onConfigureCatchUp ? (
+          <form className="source-credentials-form" onSubmit={saveCredentials}>
+            <Field label="Source credentials and verification JSON">
+              <TextArea
+                fullWidth
+                value={credentialsText}
+                onChange={(event) => setCredentialsText(event.target.value)}
+                placeholder={catchUpTemplate(source.source_type)}
+                rows={7}
+                variant="secondary"
+              />
+            </Field>
+            {credentialsParseError ? <p className="form-error">{credentialsParseError}</p> : null}
+            {configureError ? <ErrorBlock error={configureError} /> : null}
+            <div className="card-actions">
+              <Button onPress={() => setEditingCredentials(false)} size="sm" type="button" variant="secondary">
+                Cancel
+              </Button>
+              <Button isDisabled={configurePending} size="sm" type="submit" variant="primary">
+                <Check size={16} />
+                Save
+              </Button>
+            </div>
+          </form>
         ) : null}
-        {onCatchUp ? (
-          <button className="secondary-button" onClick={onCatchUp}>
-            <CloudDownload size={16} />
-            Catch up
-          </button>
-        ) : null}
+        {source.last_error ? <p className="form-error">{source.last_error}</p> : null}
       </div>
-      {editingCredentials && onConfigureCatchUp ? (
-        <form className="source-credentials-form" onSubmit={saveCredentials}>
-          <Field label="Catch-up credentials JSON">
-            <textarea
-              value={credentialsText}
-              onChange={(event) => setCredentialsText(event.target.value)}
-              placeholder={catchUpTemplate(source.source_type)}
-              rows={7}
-            />
-          </Field>
-          {credentialsParseError ? <p className="form-error">{credentialsParseError}</p> : null}
-          {configureError ? <ErrorBlock error={configureError} /> : null}
-          <div className="card-actions">
-            <button className="secondary-button" type="button" onClick={() => setEditingCredentials(false)}>
-              Cancel
-            </button>
-            <button className="primary-button" disabled={configurePending}>
-              <Check size={16} />
-              Save
-            </button>
-          </div>
-        </form>
-      ) : null}
-      {source.last_error ? <p className="form-error">{source.last_error}</p> : null}
-    </article>
+    </section>
   );
 }
 
@@ -1150,76 +1393,153 @@ function AppForm({
         setGooglePackageName("");
       }}
     >
-      <input value={name} onChange={(event) => setName(event.target.value)} placeholder="App name" required />
-      <input value={appleBundleId} onChange={(event) => setAppleBundleId(event.target.value)} placeholder="Apple bundle id" />
-      <input value={googlePackageName} onChange={(event) => setGooglePackageName(event.target.value)} placeholder="Google package" />
-      <input value={defaultCurrency} onChange={(event) => setDefaultCurrency(event.target.value.toUpperCase())} placeholder="USD" className="short-input" />
-      <button className="primary-button" disabled={pending}>
+      <Input fullWidth value={name} onChange={(event) => setName(event.target.value)} placeholder="App name" required variant="secondary" />
+      <Input fullWidth value={appleBundleId} onChange={(event) => setAppleBundleId(event.target.value)} placeholder="Apple bundle id" variant="secondary" />
+      <Input fullWidth value={googlePackageName} onChange={(event) => setGooglePackageName(event.target.value)} placeholder="Google package" variant="secondary" />
+      <Input fullWidth value={defaultCurrency} onChange={(event) => setDefaultCurrency(event.target.value.toUpperCase())} placeholder="USD" className="short-input" variant="secondary" />
+      <Button isDisabled={pending} size="sm" type="submit" variant="primary">
         <Plus size={16} />
         Add
-      </button>
+      </Button>
       {error ? <ErrorBlock error={error} /> : null}
     </form>
   );
 }
 
-function TransactionTable({ transactions, compact = false }: { transactions: TransactionRecord[]; compact?: boolean }) {
+function TransactionTable({
+  transactions,
+  compact = false,
+  onSelect,
+}: {
+  transactions: TransactionRecord[];
+  compact?: boolean;
+  onSelect?: (id: string) => void;
+}) {
   if (!transactions.length) return <EmptyState icon={<Receipt size={18} />} title="No transactions yet" />;
   return (
-    <table className={compact ? "data-table compact-table" : "data-table"}>
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Product</th>
-          <th>Source</th>
-          {!compact ? <th>Transaction</th> : null}
-          <th>Amount</th>
-          <th>Status</th>
-          {!compact ? <th>Country</th> : null}
-        </tr>
-      </thead>
-      <tbody>
+    <DataTable ariaLabel="Transactions" compact={compact}>
+      <Table.Header>
+        <Table.Column isRowHeader>Time</Table.Column>
+        <Table.Column>Product</Table.Column>
+        <Table.Column>Source</Table.Column>
+        {!compact ? <Table.Column>Transaction</Table.Column> : null}
+        <Table.Column>Amount</Table.Column>
+        {!compact ? <Table.Column>Environment</Table.Column> : null}
+        <Table.Column>Status</Table.Column>
+        {!compact ? <Table.Column>Country</Table.Column> : null}
+      </Table.Header>
+      <Table.Body>
         {transactions.map((transaction) => (
-          <tr key={transaction.id}>
-            <td>{formatDateTime(transaction.purchase_time)}</td>
-            <td>{transaction.logical_product_name ?? transaction.source_product_name ?? "Unmapped"}</td>
-            <td>{titleize(transaction.source_type)} · {titleize(transaction.platform)}</td>
-            {!compact ? <td className="mono-cell">{transaction.transaction_key}</td> : null}
-            <td>{formatMoney(transaction.amount_minor, transaction.currency)}</td>
-            <td><StatusLabel value={transaction.status} /></td>
-            {!compact ? <td>{transaction.country ?? "—"}</td> : null}
-          </tr>
+          <Table.Row className={onSelect ? "click-row" : undefined} id={transaction.id} key={transaction.id} onAction={onSelect ? () => onSelect(transaction.id) : undefined}>
+            <Table.Cell>{formatDateTime(transaction.purchase_time)}</Table.Cell>
+            <Table.Cell>{transaction.logical_product_name ?? transaction.source_product_name ?? "Unmapped"}</Table.Cell>
+            <Table.Cell>{titleize(transaction.source_type)} · {titleize(transaction.platform)}</Table.Cell>
+            {!compact ? <Table.Cell className="mono-cell">{transaction.transaction_key}</Table.Cell> : null}
+            <Table.Cell>{formatMoney(transaction.amount_minor, transaction.currency)}</Table.Cell>
+            {!compact ? <Table.Cell><StatusLabel value={transaction.environment} /></Table.Cell> : null}
+            <Table.Cell><StatusLabel value={transaction.status} /></Table.Cell>
+            {!compact ? <Table.Cell>{transaction.country ?? "—"}</Table.Cell> : null}
+          </Table.Row>
         ))}
-      </tbody>
-    </table>
+      </Table.Body>
+    </DataTable>
   );
 }
 
 function ProductTable({ products }: { products: LogicalProductRecord[] }) {
   if (!products.length) return <EmptyState icon={<Boxes size={18} />} title="No confirmed products" />;
   return (
-    <table className="data-table">
-      <thead>
-        <tr>
-          <th>Product</th>
-          <th>Kind</th>
-          <th>Period</th>
-          <th>Category</th>
-          <th>Sources</th>
-        </tr>
-      </thead>
-      <tbody>
+    <DataTable ariaLabel="Confirmed products">
+      <Table.Header>
+        <Table.Column isRowHeader>Product</Table.Column>
+        <Table.Column>Kind</Table.Column>
+        <Table.Column>Period</Table.Column>
+        <Table.Column>Category</Table.Column>
+        <Table.Column>Sources</Table.Column>
+      </Table.Header>
+      <Table.Body>
         {products.map((product) => (
-          <tr key={product.id}>
-            <td>{product.display_name}</td>
-            <td>{titleize(product.product_kind)}</td>
-            <td>{titleize(product.billing_period)}</td>
-            <td>{product.reporting_category ?? "—"}</td>
-            <td>{product.source_products.map((source) => source.external_product_id ?? source.display_name ?? source.id).join(", ") || "—"}</td>
-          </tr>
+          <Table.Row id={product.id} key={product.id}>
+            <Table.Cell>{product.display_name}</Table.Cell>
+            <Table.Cell>{titleize(product.product_kind)}</Table.Cell>
+            <Table.Cell>{titleize(product.billing_period)}</Table.Cell>
+            <Table.Cell>{product.reporting_category ?? "—"}</Table.Cell>
+            <Table.Cell>{product.source_products.map((source) => source.external_product_id ?? source.display_name ?? source.id).join(", ") || "—"}</Table.Cell>
+          </Table.Row>
         ))}
-      </tbody>
-    </table>
+      </Table.Body>
+    </DataTable>
+  );
+}
+
+function DataTable({ ariaLabel, children, compact = false }: { ariaLabel: string; children: ReactNode; compact?: boolean }) {
+  return (
+    <Table className={cx("data-table", compact && "compact-table")} variant="secondary">
+      <Table.ScrollContainer>
+        <Table.Content aria-label={ariaLabel}>{children}</Table.Content>
+      </Table.ScrollContainer>
+    </Table>
+  );
+}
+
+function cx(...classes: Array<string | false | null | undefined>) {
+  return classes.filter(Boolean).join(" ");
+}
+
+type SelectControlOption = {
+  label: string;
+  value: string;
+};
+
+const emptySelectValue = "__revtern_empty__";
+
+function selectKey(value: string) {
+  return value === "" ? emptySelectValue : value;
+}
+
+function valueFromSelectKey(key: unknown) {
+  const value = String(key);
+  return value === emptySelectValue ? "" : value;
+}
+
+function SelectControl({
+  ariaLabel,
+  className,
+  onChange,
+  options,
+  value,
+}: {
+  ariaLabel: string;
+  className?: string;
+  onChange: (value: string) => void;
+  options: SelectControlOption[];
+  value: string;
+}) {
+  const selectedKey = options.some((option) => option.value === value) ? selectKey(value) : undefined;
+  return (
+    <Select
+      aria-label={ariaLabel}
+      className={cx("select-control", className)}
+      onSelectionChange={(key) => {
+        if (key !== null) onChange(valueFromSelectKey(key));
+      }}
+      selectedKey={selectedKey}
+      variant="secondary"
+    >
+      <Select.Trigger>
+        <Select.Value />
+        <Select.Indicator />
+      </Select.Trigger>
+      <Select.Popover>
+        <ListBox>
+          {options.map((option) => (
+            <ListBox.Item id={selectKey(option.value)} key={selectKey(option.value)}>
+              {option.label}
+            </ListBox.Item>
+          ))}
+        </ListBox>
+      </Select.Popover>
+    </Select>
   );
 }
 
@@ -1227,7 +1547,7 @@ function Page({ title, actions, children }: { title: string; actions?: ReactNode
   return (
     <div className="page">
       <header className="page-header">
-        <h1>{title}</h1>
+        <Typography.Heading level={1} className="page-title">{title}</Typography.Heading>
         {actions ? <div className="page-actions">{actions}</div> : null}
       </header>
       <div className="page-content">{children}</div>
@@ -1235,25 +1555,23 @@ function Page({ title, actions, children }: { title: string; actions?: ReactNode
   );
 }
 
-function Panel({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
+function AppLink({ children, to }: { children: ReactNode; to: string }) {
   return (
-    <section className="panel">
-      <div className="panel-head">
-        <h2>{title}</h2>
-        {actions ? <div className="panel-actions">{actions}</div> : null}
-      </div>
+    <RouterNavLink className="link" to={to}>
       {children}
-    </section>
+    </RouterNavLink>
   );
 }
 
-function MetricCard({ label, value, state }: { label: string; value: string; state?: string }) {
+function Panel({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
   return (
-    <div className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <StatusLabel value={state ?? "live"} />
-    </div>
+    <Card className="panel" variant="default">
+      <Card.Header className="panel-head">
+        <Card.Title className="panel-title">{title}</Card.Title>
+        {actions ? <div className="panel-actions">{actions}</div> : null}
+      </Card.Header>
+      <Card.Content className="panel-content">{children}</Card.Content>
+    </Card>
   );
 }
 
@@ -1267,21 +1585,41 @@ function FilterBar({
   onChange: (next: Record<string, string>) => void;
 }) {
   const apps = useQuery({ queryKey: ["apps"], queryFn: () => api.apps() });
+  const products = useQuery({ queryKey: ["logical-products"], queryFn: () => api.logicalProducts() });
   return (
     <div className={compact ? "filter-bar compact-filter" : "filter-bar"}>
-      <input type="date" value={filters.from} onChange={(event) => onChange({ ...filters, from: event.target.value })} />
-      <input type="date" value={filters.to} onChange={(event) => onChange({ ...filters, to: event.target.value })} />
-      <select value={filters.app_id} onChange={(event) => onChange({ ...filters, app_id: event.target.value })}>
-        <option value="all">All apps</option>
-        {apps.data?.apps.map((app) => <option key={app.id} value={app.id}>{app.name}</option>)}
-      </select>
-      <select value={filters.platform} onChange={(event) => onChange({ ...filters, platform: event.target.value })}>
-        <option value="all">All platforms</option>
-        <option value="ios">iOS</option>
-        <option value="android">Android</option>
-        <option value="web">Web</option>
-      </select>
-      <input className="short-input" value={filters.currency} onChange={(event) => onChange({ ...filters, currency: event.target.value.toUpperCase() })} />
+      <Input aria-label="From date" className="date-input" type="date" value={filters.from} onChange={(event) => onChange({ ...filters, from: event.target.value })} variant="secondary" />
+      <Input aria-label="To date" className="date-input" type="date" value={filters.to} onChange={(event) => onChange({ ...filters, to: event.target.value })} variant="secondary" />
+      <SelectControl
+        ariaLabel="Dashboard app"
+        value={filters.app_id}
+        onChange={(app_id) => onChange({ ...filters, app_id })}
+        options={[
+          { value: "all", label: "All apps" },
+          ...(apps.data?.apps ?? []).map((app) => ({ value: app.id, label: app.name })),
+        ]}
+      />
+      <SelectControl
+        ariaLabel="Dashboard platform"
+        value={filters.platform}
+        onChange={(platform) => onChange({ ...filters, platform })}
+        options={[
+          { value: "all", label: "All platforms" },
+          { value: "ios", label: "iOS" },
+          { value: "android", label: "Android" },
+          { value: "web", label: "Web" },
+        ]}
+      />
+      <SelectControl
+        ariaLabel="Dashboard product"
+        value={filters.logical_product_id}
+        onChange={(logical_product_id) => onChange({ ...filters, logical_product_id })}
+        options={[
+          { value: "all", label: "All products" },
+          ...(products.data?.logical_products ?? []).map((product) => ({ value: product.id, label: product.display_name })),
+        ]}
+      />
+      <Input aria-label="Currency" className="short-input" value={filters.currency} onChange={(event) => onChange({ ...filters, currency: event.target.value.toUpperCase() })} variant="secondary" />
     </div>
   );
 }
@@ -1292,26 +1630,38 @@ function useDashboardFilters() {
     ...range,
     app_id: "all",
     platform: "all",
+    logical_product_id: "all",
     currency: "USD",
   });
 }
 
 function Segmented({ value, options, onChange }: { value: string; options: string[]; onChange: (value: string) => void }) {
   return (
-    <div className="segmented">
+    <ToggleButtonGroup
+      aria-label="Segmented options"
+      className="segmented"
+      disallowEmptySelection
+      onSelectionChange={(keys) => {
+        const [next] = [...keys];
+        if (next) onChange(String(next));
+      }}
+      selectedKeys={[value]}
+      selectionMode="single"
+      size="sm"
+    >
       {options.map((option) => (
-        <button key={option} className={option === value ? "active" : ""} onClick={() => onChange(option)} type="button">
+        <ToggleButton id={option} key={option} size="sm" variant="ghost">
           {titleize(option)}
-        </button>
+        </ToggleButton>
       ))}
-    </div>
+    </ToggleButtonGroup>
   );
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="field">
-      <span>{label}</span>
+      <span className="field-label">{label}</span>
       {children}
     </label>
   );
@@ -1319,28 +1669,52 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 
 function StatusLabel({ value }: { value: string }) {
   const normalized = value.toLowerCase();
-  return <span className={`status-label ${statusClass(normalized)}`}>{titleize(value)}</span>;
+  return (
+    <Chip color={statusColor(normalized)} size="sm" variant="soft">
+      {titleize(value)}
+    </Chip>
+  );
 }
 
 function statusClass(value: string) {
-  if (["active", "paid", "renewed", "completed", "processed", "live", "verified"].includes(value)) return "good";
+  if (["active", "paid", "renewed", "completed", "processed", "live", "verified", "production", "reconciled"].includes(value)) return "good";
   if (["failed", "dead", "error", "refunded", "revoked"].includes(value)) return "bad";
-  if (["estimated", "warning", "unmapped", "waiting_for_events", "queued", "running", "stored"].includes(value)) return "warn";
+  if (["estimated", "warning", "unmapped", "waiting_for_events", "queued", "running", "stored", "sandbox", "test", "unknown"].includes(value)) return "warn";
   return "neutral";
+}
+
+function statusColor(value: string) {
+  switch (statusClass(value)) {
+    case "good":
+      return "success";
+    case "bad":
+      return "danger";
+    case "warn":
+      return "warning";
+    default:
+      return "default";
+  }
 }
 
 function ErrorBlock({ error }: { error: unknown }) {
   const message = error instanceof ApiError ? error.message : error instanceof Error ? error.message : "Request failed";
-  return <div className="error-block">{message}</div>;
+  return (
+    <Alert status="danger">
+      <Alert.Indicator><AlertTriangle size={16} /></Alert.Indicator>
+      <Alert.Content>
+        <Alert.Description>{message}</Alert.Description>
+      </Alert.Content>
+    </Alert>
+  );
 }
 
 function EmptyState({ icon, title, action }: { icon: ReactNode; title: string; action?: ReactNode }) {
   return (
-    <div className="empty-state">
+    <HeroEmptyState>
       {icon}
       <span>{title}</span>
       {action}
-    </div>
+    </HeroEmptyState>
   );
 }
 
@@ -1349,18 +1723,118 @@ function ChartFrame({ children }: { children: ReactNode }) {
 }
 
 function JsonDrawer({ title, value, onClose }: { title: string; value: unknown; onClose: () => void }) {
+  const drawer = useOverlayState({
+    isOpen: true,
+    onOpenChange: (isOpen) => {
+      if (!isOpen) onClose();
+    },
+  });
+
   return (
-    <div className="drawer-backdrop" onClick={onClose}>
-      <aside className="json-drawer" onClick={(event) => event.stopPropagation()}>
-        <div className="drawer-head">
-          <strong>{title}</strong>
-          <button className="icon-button" onClick={onClose}>
-            <X size={16} />
-          </button>
-        </div>
-        <pre>{JSON.stringify(value, null, 2)}</pre>
-      </aside>
-    </div>
+    <Drawer state={drawer}>
+      <Drawer.Backdrop isDismissable variant="opaque">
+        <Drawer.Content placement="right">
+          <Drawer.Dialog aria-label={title}>
+            <Drawer.Header>
+              <Drawer.Heading>{title}</Drawer.Heading>
+              <Drawer.CloseTrigger />
+            </Drawer.Header>
+            <Drawer.Body className="json-drawer-body">
+              <pre className="json-drawer-pre">{JSON.stringify(value, null, 2)}</pre>
+            </Drawer.Body>
+          </Drawer.Dialog>
+        </Drawer.Content>
+      </Drawer.Backdrop>
+    </Drawer>
+  );
+}
+
+type EvidenceEvent = {
+  id: string;
+  event_type: string;
+  environment: string;
+  occurred_at: string;
+  raw_event_id: string;
+  amount_minor?: number | null;
+  currency?: string | null;
+  warnings: string[];
+};
+
+function EvidenceDrawer({
+  title,
+  subtitle,
+  events,
+  error,
+  loading,
+  onClose,
+  subscription,
+}: {
+  title: string;
+  subtitle?: string;
+  events: EvidenceEvent[];
+  error: unknown;
+  loading: boolean;
+  onClose: () => void;
+  subscription?: SubscriptionRecord;
+}) {
+  const drawer = useOverlayState({
+    isOpen: true,
+    onOpenChange: (isOpen) => {
+      if (!isOpen) onClose();
+    },
+  });
+
+  return (
+    <Drawer state={drawer}>
+      <Drawer.Backdrop isDismissable variant="opaque">
+        <Drawer.Content placement="right">
+          <Drawer.Dialog aria-label={title}>
+            <Drawer.Header>
+              <div className="evidence-heading">
+                <Drawer.Heading>{title}</Drawer.Heading>
+                {subtitle ? <span>{subtitle}</span> : null}
+              </div>
+              <Drawer.CloseTrigger />
+            </Drawer.Header>
+            <Drawer.Body className="evidence-drawer-body">
+              {loading ? <div className="drawer-loading">Loading source evidence…</div> : null}
+              {error ? <ErrorBlock error={error} /> : null}
+              {subscription ? (
+                <dl className="evidence-summary">
+                  <div><dt>Current status</dt><dd><StatusLabel value={subscription.status} /></dd></div>
+                  <div><dt>Period start</dt><dd>{formatDateTime(subscription.current_period_start)}</dd></div>
+                  <div><dt>Period end</dt><dd>{formatDateTime(subscription.current_period_end)}</dd></div>
+                  <div><dt>Renewal</dt><dd>{subscription.will_renew ? "Will renew" : "Will not renew"}</dd></div>
+                </dl>
+              ) : null}
+              {!loading && !error && !events.length ? (
+                <EmptyState icon={<Database size={18} />} title="No linked evidence events" />
+              ) : null}
+              {events.length ? (
+                <ol className="evidence-timeline">
+                  {events.map((event) => (
+                    <li key={event.id}>
+                      <div className="evidence-event-head">
+                        <strong>{titleize(event.event_type)}</strong>
+                        <StatusLabel value={event.environment} />
+                      </div>
+                      <span>{formatDateTime(event.occurred_at)}</span>
+                      {event.amount_minor != null ? <span>{formatMoney(event.amount_minor, event.currency ?? "USD")}</span> : null}
+                      <code>{event.raw_event_id}</code>
+                      {event.warnings.length ? (
+                        <ul>
+                          {event.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+                        </ul>
+                      ) : null}
+                    </li>
+                  ))}
+                </ol>
+              ) : null}
+            </Drawer.Body>
+          </Drawer.Dialog>
+        </Drawer.Content>
+      </Drawer.Backdrop>
+    </Drawer>
   );
 }
 
@@ -1397,7 +1871,9 @@ function catchUpTemplate(sourceType: string) {
         key_id: "App Store Connect key id",
         private_key: "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----",
         bundle_id: "com.example.app",
-        environment: "production"
+        app_apple_id: "1234567890",
+        environment: "both",
+        apple_root_ca_pem: "-----BEGIN CERTIFICATE-----\\nApple Root CA downloaded from apple.com/certificateauthority\\n-----END CERTIFICATE-----"
       },
       null,
       2,
@@ -1407,8 +1883,10 @@ function catchUpTemplate(sourceType: string) {
     return JSON.stringify(
       {
         pubsub_subscription: "projects/PROJECT_ID/subscriptions/SUBSCRIPTION_ID",
+        pubsub_oidc_audience: "https://revtern.example.com/webhooks/google-play/SOURCE_ID",
+        pubsub_service_account_email: "pubsub-push@example.iam.gserviceaccount.com",
         service_account_json: {
-          client_email: "revtern-pubsub@example.iam.gserviceaccount.com",
+          client_email: "revtern-google-play@example.iam.gserviceaccount.com",
           private_key: "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----",
           token_uri: "https://oauth2.googleapis.com/token"
         }

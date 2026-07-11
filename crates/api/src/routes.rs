@@ -9,7 +9,7 @@ use axum::{
 };
 use axum_extra::extract::CookieJar;
 use revtern_connectors::extract_event;
-use revtern_core::{new_id, payload_sha256, sha256_hex};
+use revtern_core::{new_id, payload_sha256};
 use revtern_jobs::{enqueue_normalization, process_normalization_job, process_raw_event};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -25,6 +25,7 @@ use crate::{
     config::AuthMode,
     crypto,
     error::{ApiError, ApiResult},
+    purchase_lookup, webhook_verification,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -80,8 +81,16 @@ pub fn router(state: AppState) -> Router {
                 .route("/demo/seed", post(seed_demo))
                 .route("/export/transactions.csv", get(export_transactions_csv)),
         )
+        .route("/readyz", get(readyz))
         .route("/webhooks/{source_type}/{source_id}", post(ingest_webhook))
         .with_state(state)
+}
+
+async fn readyz(State(state): State<AppState>) -> ApiResult<&'static str> {
+    sqlx::query_scalar::<_, i32>("select 1")
+        .fetch_one(&state.pool)
+        .await?;
+    Ok("ready")
 }
 
 #[derive(Debug, Deserialize)]
@@ -902,16 +911,26 @@ async fn get_transaction(
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("transaction not found".to_string()))?;
+    let transaction_key: String = row.try_get("transaction_key")?;
+    let evidence_event_id = row
+        .try_get::<Option<String>, _>("created_from_event_id")?
+        .or(row.try_get::<Option<String>, _>("latest_event_id")?);
     let event_rows = sqlx::query(
         r#"
-        select ne.id, ne.event_type, ne.occurred_at, ne.raw_event_id, ne.warnings
+        select ne.id, ne.event_type, ne.environment, ne.occurred_at, ne.raw_event_id,
+               ne.amount_minor, ne.currency, ne.warnings
         from normalized_events ne
-        join transactions t on t.created_from_event_id = ne.id or t.latest_event_id = ne.id
-        where t.id = $1
+        where ne.workspace_id = $1
+          and ne.transaction_key = $2
+          and ne.data_source_id = (
+            select data_source_id from normalized_events where id = $3
+          )
         order by ne.occurred_at desc
         "#,
     )
-    .bind(&transaction_id)
+    .bind(&user.workspace.id)
+    .bind(&transaction_key)
+    .bind(evidence_event_id.as_deref())
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(json!({
@@ -939,6 +958,7 @@ async fn list_subscriptions(
     push_optional_filter(&mut query, "s.status", filters.get("status"));
     push_optional_filter(&mut query, "s.app_id", filters.get("app_id"));
     push_optional_filter(&mut query, "s.platform", filters.get("platform"));
+    push_optional_filter(&mut query, "s.environment", filters.get("environment"));
     push_optional_filter(
         &mut query,
         "s.logical_product_id",
@@ -949,7 +969,6 @@ async fn list_subscriptions(
         "s.source_product_id",
         filters.get("source_product_id"),
     );
-    push_optional_filter(&mut query, "s.country", filters.get("country"));
     query.push(" order by s.updated_at desc limit 300");
     let rows = query.build().fetch_all(&state.pool).await?;
     let subscriptions = rows
@@ -982,7 +1001,7 @@ async fn get_subscription(
     let subscription_key: String = row.try_get("subscription_key")?;
     let timeline = sqlx::query(
         r#"
-        select id, event_type, occurred_at, raw_event_id, amount_minor, currency, warnings
+        select id, event_type, environment, occurred_at, raw_event_id, amount_minor, currency, warnings
         from normalized_events
         where workspace_id = $1 and subscription_key = $2
         order by occurred_at asc
@@ -1017,33 +1036,39 @@ async fn metrics_overview(
     let country = filters.get("country").map(String::as_str);
 
     let mut revenue = QueryBuilder::<Postgres>::new(
-        "select coalesce(sum(amount_minor) filter (where status in ('paid','renewed')),0)::bigint as gross, coalesce(sum(refund_amount_minor),0)::bigint as refunds, count(*) filter (where status in ('paid','renewed')) as purchases, count(*) filter (where status = 'renewed') as renewals from transactions where workspace_id = ",
+        "select coalesce(sum(ne.amount_minor) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted','renewal')),0)::bigint as gross, coalesce(sum(abs(ne.amount_minor)) filter (where ne.event_type in ('refund','partial_refund','revocation')),0)::bigint as refunds, count(*) filter (where ne.event_type = 'renewal') as renewals from metric_events ne where ne.workspace_id = ",
     );
     revenue.push_bind(&user.workspace.id);
-    revenue.push(" and purchase_time::date between ");
+    revenue.push(" and ne.occurred_at::date between ");
     revenue.push_bind(from);
-    revenue.push(" and ");
+    revenue.push("::date and ");
     revenue.push_bind(to);
-    revenue.push(" and currency = ");
+    revenue.push("::date");
+    revenue.push(" and ne.currency = ");
     revenue.push_bind(&currency);
-    push_optional_filter(&mut revenue, "app_id", app_id);
-    push_optional_filter(&mut revenue, "platform", platform);
-    push_optional_filter(&mut revenue, "logical_product_id", product);
-    push_optional_filter(&mut revenue, "country", country);
+    revenue.push(" and ne.environment = 'production'");
+    push_optional_filter(&mut revenue, "ne.app_id", app_id);
+    push_optional_filter(&mut revenue, "ne.platform", platform);
+    push_optional_filter(&mut revenue, "ne.logical_product_id", product);
+    push_optional_filter(&mut revenue, "ne.country", country);
     let revenue_row = revenue.build().fetch_one(&state.pool).await?;
     let gross: i64 = revenue_row.try_get("gross")?;
     let refunds: i64 = revenue_row.try_get("refunds")?;
-    let purchases: i64 = revenue_row.try_get("purchases")?;
     let renewals: i64 = revenue_row.try_get("renewals")?;
 
     let mut subs = QueryBuilder::<Postgres>::new(
         "select count(*) filter (where status in ('active','trialing','cancelled_active','grace_period','billing_retry')) as active, count(*) filter (where started_at::date between ",
     );
     subs.push_bind(from);
-    subs.push(" and ");
+    subs.push("::date and ");
     subs.push_bind(to);
-    subs.push(") as new_subs, count(*) filter (where status in ('expired','refunded')) as churned from subscriptions where workspace_id = ");
+    subs.push("::date) as new_subs, count(*) filter (where status in ('expired','refunded') and status_updated_at::date between ");
+    subs.push_bind(from);
+    subs.push("::date and ");
+    subs.push_bind(to);
+    subs.push("::date) as churned from subscriptions where workspace_id = ");
     subs.push_bind(&user.workspace.id);
+    subs.push(" and environment = 'production'");
     push_optional_filter(&mut subs, "app_id", app_id);
     push_optional_filter(&mut subs, "platform", platform);
     push_optional_filter(&mut subs, "logical_product_id", product);
@@ -1052,10 +1077,10 @@ async fn metrics_overview(
     let new_subscriptions: i64 = subs_row.try_get("new_subs")?;
     let churned: i64 = subs_row.try_get("churned")?;
     let warnings = metric_warnings(&state, &user.workspace.id).await?;
-    let refund_rate = if purchases == 0 {
+    let refund_rate = if gross <= 0 {
         0.0
     } else {
-        refunds as f64 / gross.max(1) as f64
+        refunds as f64 / gross as f64
     };
 
     Ok(Json(json!({
@@ -1085,26 +1110,27 @@ async fn metrics_revenue_timeseries(
         .get("currency")
         .cloned()
         .unwrap_or_else(|| "USD".to_string());
-    let rows = sqlx::query(
+    let mut query = QueryBuilder::<Postgres>::new(
         r#"
-        select purchase_time::date as date,
-               coalesce(sum(amount_minor) filter (where status in ('paid','renewed')),0)::bigint as gross_revenue_minor,
-               coalesce(sum(refund_amount_minor),0)::bigint as refund_amount_minor,
-               (coalesce(sum(amount_minor) filter (where status in ('paid','renewed')),0) - coalesce(sum(refund_amount_minor),0))::bigint as net_revenue_minor,
-               count(*) filter (where status in ('paid','renewed')) as purchase_count,
-               count(*) filter (where status = 'renewed') as renewal_count
-        from transactions
-        where workspace_id = $1 and purchase_time::date between $2 and $3 and currency = $4
-        group by purchase_time::date
-        order by date asc
+        select d.date,
+               coalesce(sum(ne.amount_minor) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted','renewal')),0)::bigint as gross_revenue_minor,
+               coalesce(sum(abs(ne.amount_minor)) filter (where ne.event_type in ('refund','partial_refund','revocation')),0)::bigint as refund_amount_minor,
+               (coalesce(sum(ne.amount_minor) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted','renewal')),0) - coalesce(sum(abs(ne.amount_minor)) filter (where ne.event_type in ('refund','partial_refund','revocation')),0))::bigint as net_revenue_minor,
+               count(ne.id) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted')) as purchase_count,
+               count(ne.id) filter (where ne.event_type = 'renewal') as renewal_count
+        from generate_series(
         "#,
-    )
-    .bind(&user.workspace.id)
-    .bind(from)
-    .bind(to)
-    .bind(currency)
-    .fetch_all(&state.pool)
-    .await?;
+    );
+    query.push_bind(from);
+    query.push("::date, ");
+    query.push_bind(to);
+    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date and ne.workspace_id = ");
+    query.push_bind(&user.workspace.id);
+    query.push(" and ne.environment = 'production' and ne.currency = ");
+    query.push_bind(&currency);
+    push_normalized_filters(&mut query, &filters);
+    query.push(" group by d.date order by d.date asc");
+    let rows = query.build().fetch_all(&state.pool).await?;
     Ok(Json(json!({
         "series": rows.into_iter().map(daily_revenue_json).collect::<ApiResult<Vec<_>>>()?
     })))
@@ -1116,74 +1142,35 @@ async fn metrics_subscription_timeseries(
     Query(filters): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
     let (from, to) = date_range(&filters)?;
-    let rows = sqlx::query(
+    let mut query = QueryBuilder::<Postgres>::new(
         r#"
-        with days as (
-          select generate_series($1::date, $2::date, interval '1 day')::date as date
-        ),
-        new_subs as (
-          select started_at::date as date, count(*) as value
-          from subscriptions
-          where workspace_id = $3 and started_at::date between $1 and $2
-          group by started_at::date
-        ),
-        renewals as (
-          select purchase_time::date as date, count(*) as value
-          from transactions
-          where workspace_id = $3 and status = 'renewed' and purchase_time::date between $1 and $2
-          group by purchase_time::date
-        ),
-        cancels as (
-          select cancelled_at::date as date, count(*) as value
-          from subscriptions
-          where workspace_id = $3 and cancelled_at is not null and cancelled_at::date between $1 and $2
-          group by cancelled_at::date
-        ),
-        expirations as (
-          select expired_at::date as date, count(*) as value
-          from subscriptions
-          where workspace_id = $3 and expired_at is not null and expired_at::date between $1 and $2
-          group by expired_at::date
-        ),
-        trial_starts as (
-          select occurred_at::date as date, count(distinct coalesce(subscription_key, transaction_key, raw_event_id)) as value
-          from normalized_events
-          where workspace_id = $3 and event_type = 'trial_started' and occurred_at::date between $1 and $2
-          group by occurred_at::date
-        ),
-        trial_conversions as (
-          select occurred_at::date as date, count(distinct coalesce(subscription_key, transaction_key, raw_event_id)) as value
-          from normalized_events
-          where workspace_id = $3 and event_type = 'trial_converted' and occurred_at::date between $1 and $2
-          group by occurred_at::date
-        ),
-        series as (
-          select d.date,
-                 coalesce(new_subs.value,0)::bigint as new_subscription_count,
-                 coalesce(renewals.value,0)::bigint as renewal_count,
-                 coalesce(cancels.value,0)::bigint as cancel_count,
-                 coalesce(expirations.value,0)::bigint as expiration_count,
-                 coalesce(trial_starts.value,0)::bigint as trial_start_count,
-                 coalesce(trial_conversions.value,0)::bigint as trial_conversion_count
-          from days d
-          left join new_subs on new_subs.date = d.date
-          left join renewals on renewals.date = d.date
-          left join cancels on cancels.date = d.date
-          left join expirations on expirations.date = d.date
-          left join trial_starts on trial_starts.date = d.date
-          left join trial_conversions on trial_conversions.date = d.date
-        )
-        select *
-        from series
-        where new_subscription_count + renewal_count + cancel_count + expiration_count + trial_start_count + trial_conversion_count > 0
-        order by date asc
+        select d.date,
+               count(distinct coalesce(ne.subscription_key, ne.transaction_key, ne.raw_event_id)) filter (where ne.event_type = 'purchase' and ne.subscription_key is not null) as new_subscription_count,
+               count(ne.id) filter (where ne.event_type = 'renewal') as renewal_count,
+               count(distinct coalesce(ne.subscription_key, ne.raw_event_id)) filter (where ne.event_type = 'cancellation') as cancel_count,
+               count(distinct coalesce(ne.subscription_key, ne.raw_event_id)) filter (where ne.event_type = 'expiration') as expiration_count,
+               count(distinct coalesce(ne.subscription_key, ne.transaction_key, ne.raw_event_id)) filter (where ne.event_type = 'trial_started') as trial_start_count,
+               count(distinct coalesce(ne.subscription_key, ne.transaction_key, ne.raw_event_id)) filter (where ne.event_type = 'trial_converted') as trial_conversion_count
+        from generate_series(
         "#,
-    )
-    .bind(from)
-    .bind(to)
-    .bind(&user.workspace.id)
-    .fetch_all(&state.pool)
-    .await?;
+    );
+    query.push_bind(from);
+    query.push("::date, ");
+    query.push_bind(to);
+    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date and ne.workspace_id = ");
+    query.push_bind(&user.workspace.id);
+    query.push(" and ne.environment = 'production'");
+    push_optional_filter(&mut query, "ne.app_id", filters.get("app_id"));
+    push_optional_filter(&mut query, "ne.platform", filters.get("platform"));
+    push_optional_filter(
+        &mut query,
+        "ne.logical_product_id",
+        filters
+            .get("logical_product_id")
+            .or_else(|| filters.get("product")),
+    );
+    query.push(" group by d.date order by d.date asc");
+    let rows = query.build().fetch_all(&state.pool).await?;
     Ok(Json(json!({
         "series": rows.into_iter().map(daily_subscription_json).collect::<ApiResult<Vec<_>>>()?
     })))
@@ -1196,47 +1183,38 @@ async fn metrics_breakdown(
 ) -> ApiResult<Json<Value>> {
     let (from, to) = date_range(&filters)?;
     let by = filters.get("by").map(String::as_str).unwrap_or("product");
-    let (select_expr, join_expr) = match by {
-        "app" => (
-            "coalesce(a.name, 'Unassigned')",
-            "left join apps a on a.id = t.app_id left join logical_products lp on false",
-        ),
-        "platform" => (
-            "coalesce(t.platform, 'unknown')",
-            "left join logical_products lp on false left join apps a on false",
-        ),
-        "country" => (
-            "coalesce(t.country, 'unknown')",
-            "left join logical_products lp on false left join apps a on false",
-        ),
-        "source" => (
-            "t.source_type",
-            "left join logical_products lp on false left join apps a on false",
-        ),
-        _ => (
-            "coalesce(lp.display_name, 'Unmapped')",
-            "left join logical_products lp on lp.id = t.logical_product_id left join apps a on false",
-        ),
+    let select_expr = match by {
+        "app" => "coalesce(a.name, 'Unassigned')",
+        "platform" => "coalesce(ne.platform, 'unknown')",
+        "country" => "coalesce(ne.country, 'unknown')",
+        "source" => "coalesce(ds.name, ds.source_type, 'unknown')",
+        _ => "coalesce(lp.display_name, 'Unmapped')",
     };
-    let sql = format!(
+    let mut query = QueryBuilder::<Postgres>::new(format!(
         r#"
-        select {select_expr} as label, coalesce(sum(t.amount_minor) filter (where t.status in ('paid','renewed')),0)::bigint as gross_revenue_minor,
-               coalesce(sum(t.refund_amount_minor),0)::bigint as refund_amount_minor,
-               count(*) as transaction_count
-        from transactions t
-        {join_expr}
-        where t.workspace_id = $1 and t.purchase_time::date between $2 and $3
-        group by label
-        order by gross_revenue_minor desc
-        limit 40
+        select {select_expr} as label,
+               coalesce(sum(ne.amount_minor) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted','renewal')),0)::bigint as gross_revenue_minor,
+               coalesce(sum(abs(ne.amount_minor)) filter (where ne.event_type in ('refund','partial_refund','revocation')),0)::bigint as refund_amount_minor,
+               count(ne.id) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted','renewal')) as transaction_count
+        from metric_events ne
+        left join logical_products lp on lp.id = ne.logical_product_id
+        left join apps a on a.id = ne.app_id
+        left join data_sources ds on ds.id = ne.data_source_id
+        where ne.workspace_id =
         "#
-    );
-    let rows = sqlx::query(&sql)
-        .bind(&user.workspace.id)
-        .bind(from)
-        .bind(to)
-        .fetch_all(&state.pool)
-        .await?;
+    ));
+    query.push_bind(&user.workspace.id);
+    query.push(" and ne.occurred_at::date between ");
+    query.push_bind(from);
+    query.push("::date and ");
+    query.push_bind(to);
+    query.push("::date and ne.environment = 'production'");
+    if let Some(currency) = filters.get("currency") {
+        push_optional_filter(&mut query, "ne.currency", Some(currency));
+    }
+    push_normalized_filters(&mut query, &filters);
+    query.push(" group by label order by gross_revenue_minor desc limit 40");
+    let rows = query.build().fetch_all(&state.pool).await?;
     Ok(Json(json!({
         "by": by,
         "items": rows.into_iter().map(breakdown_json).collect::<ApiResult<Vec<_>>>()?
@@ -1308,6 +1286,15 @@ struct StoredWebhookPayload {
     processing_error: Option<String>,
 }
 
+struct WebhookStoreContext<'a> {
+    workspace_id: &'a str,
+    source_id: &'a str,
+    source_type: &'a str,
+    signature_verified: bool,
+    sync_run_id: Option<&'a str>,
+    credentials: Option<&'a Value>,
+}
+
 async fn run_webhook_catch_up(
     state: &AppState,
     source: &sqlx::postgres::PgRow,
@@ -1328,18 +1315,21 @@ async fn run_webhook_catch_up(
     } = batch;
     let records_seen = payloads.len() as i64;
     let mut records_inserted = 0_i64;
+    let store_context = WebhookStoreContext {
+        workspace_id: &workspace_id,
+        source_id,
+        source_type,
+        signature_verified: true,
+        sync_run_id: Some(sync_run_id),
+        credentials: Some(&credentials),
+    };
 
     for payload in payloads {
-        let stored = store_webhook_payload(
-            state,
-            &workspace_id,
-            source_id,
-            source_type,
-            &payload,
-            true,
-            Some(sync_run_id),
-        )
-        .await?;
+        if source_type == "app_store" {
+            webhook_verification::verify_app_store_payload(&payload, Some(&credentials))
+                .map_err(|error| ApiError::Unauthorized(error.to_string()))?;
+        }
+        let stored = store_webhook_payload(state, &payload, &store_context).await?;
         if stored.inserted {
             records_inserted += 1;
         }
@@ -1354,14 +1344,19 @@ async fn run_webhook_catch_up(
 
 async fn store_webhook_payload(
     state: &AppState,
-    workspace_id: &str,
-    source_id: &str,
-    source_type: &str,
     payload: &Value,
-    signature_verified: bool,
-    sync_run_id: Option<&str>,
+    context: &WebhookStoreContext<'_>,
 ) -> ApiResult<StoredWebhookPayload> {
-    let processing_payload: Option<Value> = None;
+    let WebhookStoreContext {
+        workspace_id,
+        source_id,
+        source_type,
+        signature_verified,
+        sync_run_id,
+        credentials,
+    } = *context;
+    let processing_payload =
+        purchase_lookup::processing_payload(source_type, payload, credentials).await;
     let extraction_payload = processing_payload.as_ref().unwrap_or(payload);
     let fallback = payload_sha256(payload);
     let extracted = extract_event(source_type, extraction_payload, &fallback);
@@ -1370,11 +1365,11 @@ async fn store_webhook_payload(
     let inserted = sqlx::query(
         r#"
         insert into raw_events (
-          id, workspace_id, data_source_id, source_type, source_event_id, source_event_type,
+          id, workspace_id, data_source_id, source_type, source_event_id, source_event_type, environment,
           source_app_id, occurred_at, received_at, payload, processing_payload, payload_sha256,
           signature_verified, processing_status, sync_run_id
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9, $10, $11, $12, 'stored', $13)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, $13, 'stored', $14)
         on conflict (data_source_id, source_event_id) do nothing
         returning id
         "#,
@@ -1385,6 +1380,7 @@ async fn store_webhook_payload(
     .bind(source_type)
     .bind(&extracted.source_event_id)
     .bind(&extracted.source_event_type)
+    .bind(&extracted.environment)
     .bind(&extracted.source_app_id)
     .bind(extracted.occurred_at)
     .bind(payload)
@@ -1469,17 +1465,72 @@ async fn ingest_webhook(
         .ok_or_else(|| ApiError::NotFound("data source not found".to_string()))?;
     let workspace_id: String = source.try_get("workspace_id")?;
     let secret_hash: Option<String> = source.try_get("webhook_secret_hash")?;
-    let signature_verified = verify_webhook_secret(secret_hash.as_deref(), &headers, &payload);
-    let stored = store_webhook_payload(
-        &state,
-        &workspace_id,
-        &source_id,
-        &source_type,
-        &payload,
+    let encrypted_credentials: Option<String> = source.try_get("encrypted_credentials")?;
+    let credentials = optional_source_credentials(&state, encrypted_credentials.as_deref())?;
+    let signature_verified = match source_type.as_str() {
+        "app_store" => {
+            webhook_verification::verify_app_store_payload(&payload, credentials.as_ref())
+                .map_err(|error| {
+                    tracing::warn!(source_id, ?error, "rejected unverified App Store webhook");
+                    ApiError::Unauthorized(
+                        "App Store signed payload verification failed".to_string(),
+                    )
+                })?;
+            true
+        }
+        "google_play" => {
+            let shared_secret_verified = webhook_verification::verify_shared_secret(
+                secret_hash.as_deref(),
+                &headers,
+                &payload,
+            );
+            let oidc_verified = if shared_secret_verified {
+                false
+            } else {
+                webhook_verification::verify_google_pubsub_oidc(&headers, credentials.as_ref())
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(
+                            source_id,
+                            ?error,
+                            "rejected unverified Google Pub/Sub webhook"
+                        );
+                        ApiError::Unauthorized(
+                            "Google Pub/Sub push verification failed".to_string(),
+                        )
+                    })?
+            };
+            if !oidc_verified && !shared_secret_verified {
+                return Err(ApiError::Unauthorized(
+                    "Google Play webhooks require Pub/Sub OIDC or a configured shared secret"
+                        .to_string(),
+                ));
+            }
+            true
+        }
+        _ => {
+            let verified = webhook_verification::verify_shared_secret(
+                secret_hash.as_deref(),
+                &headers,
+                &payload,
+            );
+            if secret_hash.is_some() && !verified {
+                return Err(ApiError::Unauthorized(
+                    "webhook secret verification failed".to_string(),
+                ));
+            }
+            verified
+        }
+    };
+    let store_context = WebhookStoreContext {
+        workspace_id: &workspace_id,
+        source_id: &source_id,
+        source_type: &source_type,
         signature_verified,
-        None,
-    )
-    .await?;
+        sync_run_id: None,
+        credentials: credentials.as_ref(),
+    };
+    let stored = store_webhook_payload(&state, &payload, &store_context).await?;
     Ok(Json(json!({
         "received": true,
         "raw_event_id": stored.raw_event_id,
@@ -1546,10 +1597,10 @@ async fn seed_demo(
         let row = sqlx::query(
             r#"
             insert into raw_events (
-              id, workspace_id, data_source_id, source_type, source_event_id, source_event_type, source_app_id,
+              id, workspace_id, data_source_id, source_type, source_event_id, source_event_type, environment, source_app_id,
               occurred_at, received_at, payload, payload_sha256, signature_verified, processing_status
             )
-            values ($1, $2, $3, 'revenuecat', $4, $5, $6, $7, now(), $8, $9, true, 'stored')
+            values ($1, $2, $3, 'revenuecat', $4, $5, $6, $7, $8, now(), $9, $10, true, 'stored')
             on conflict (data_source_id, source_event_id) do nothing
             returning id
             "#,
@@ -1559,6 +1610,7 @@ async fn seed_demo(
         .bind(&source_id)
         .bind(&extracted.source_event_id)
         .bind(&extracted.source_event_type)
+        .bind(&extracted.environment)
         .bind(&extracted.source_app_id)
         .bind(extracted.occurred_at)
         .bind(&payload)
@@ -1587,7 +1639,7 @@ async fn export_transactions_csv(
 ) -> ApiResult<Response> {
     let rows = sqlx::query(
         r#"
-        select t.purchase_time, t.transaction_key, t.source_type, t.platform, coalesce(lp.display_name, sp.display_name, 'Unmapped') as product,
+        select t.purchase_time, t.transaction_key, t.source_type, t.platform, t.environment, coalesce(lp.display_name, sp.display_name, 'Unmapped') as product,
                t.amount_minor, t.currency, t.country, t.status
         from transactions t
         left join source_products sp on sp.id = t.source_product_id
@@ -1600,7 +1652,7 @@ async fn export_transactions_csv(
     .fetch_all(&state.pool)
     .await?;
     let mut csv = String::from(
-        "purchase_time,transaction_key,source_type,platform,product,amount_minor,currency,country,status\n",
+        "purchase_time,transaction_key,source_type,platform,environment,product,amount_minor,currency,country,status\n",
     );
     for row in rows {
         let line = [
@@ -1610,6 +1662,7 @@ async fn export_transactions_csv(
             row.try_get::<String, _>("source_type")?,
             row.try_get::<Option<String>, _>("platform")?
                 .unwrap_or_default(),
+            row.try_get::<String, _>("environment")?,
             row.try_get::<String, _>("product")?,
             row.try_get::<i64, _>("amount_minor")?.to_string(),
             row.try_get::<String, _>("currency")?,
@@ -1666,35 +1719,6 @@ fn normalize_source_type(source_type: &str) -> ApiResult<String> {
     } else {
         normalized
     })
-}
-
-fn verify_webhook_secret(secret_hash: Option<&str>, headers: &HeaderMap, payload: &Value) -> bool {
-    let Some(secret_hash) = secret_hash else {
-        return false;
-    };
-    let header_secret = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim_start_matches("Bearer ").trim().to_string())
-        .or_else(|| {
-            headers
-                .get("x-revtern-webhook-secret")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            headers
-                .get("x-revenuecat-authorization")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        });
-    if let Some(candidate) = header_secret {
-        return sha256_hex(candidate.as_bytes()) == secret_hash;
-    }
-    payload
-        .get("shared_secret")
-        .and_then(Value::as_str)
-        .is_some_and(|candidate| sha256_hex(candidate.as_bytes()) == secret_hash)
 }
 
 async fn ensure_app(state: &AppState, workspace_id: &str, app_id: &str) -> ApiResult<()> {
@@ -1888,6 +1912,46 @@ async fn metric_warnings(state: &AppState, workspace_id: &str) -> ApiResult<Vec<
             .bind(workspace_id)
             .fetch_one(&state.pool)
             .await?;
+    let non_production_transactions: i64 = sqlx::query_scalar(
+        "select count(*) from transactions where workspace_id = $1 and environment <> 'production'",
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let unknown_transactions: i64 = sqlx::query_scalar(
+        "select count(*) from transactions where workspace_id = $1 and environment = 'unknown'",
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let incomplete_money_events: i64 = sqlx::query_scalar(
+        r#"
+        select count(*)
+        from normalized_events
+        where workspace_id = $1
+          and environment = 'production'
+          and event_type in ('purchase','one_time_purchase','trial_converted','renewal','refund','partial_refund','revocation')
+          and (amount_minor is null or currency is null or currency = 'UNKNOWN')
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let duplicate_groups: i64 = sqlx::query_scalar(
+        r#"
+        select count(*)
+        from (
+          select ne.event_type, ne.transaction_key
+          from normalized_events ne
+          where ne.workspace_id = $1 and ne.transaction_key is not null
+          group by ne.event_type, ne.transaction_key
+          having count(distinct ne.data_source_id) > 1
+        ) duplicates
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
     let mut warnings = vec![];
     if source_count == 0 {
         warnings.push("No data source is connected yet.".to_string());
@@ -1902,6 +1966,27 @@ async fn metric_warnings(state: &AppState, workspace_id: &str) -> ApiResult<Vec<
     }
     if failed_jobs > 0 {
         warnings.push(format!("{failed_jobs} background job(s) need attention."));
+    }
+    if non_production_transactions > 0 {
+        warnings.push(format!(
+            "{non_production_transactions} non-production or unverified transaction(s) are excluded from revenue metrics."
+        ));
+    }
+    if unknown_transactions > 0 {
+        warnings.push(
+            "Some Google Play transactions are unverified; configure Android Publisher API access to identify test vs production purchases."
+                .to_string(),
+        );
+    }
+    if incomplete_money_events > 0 {
+        warnings.push(format!(
+            "{incomplete_money_events} financial event(s) are missing amount or currency and cannot produce a complete revenue total."
+        ));
+    }
+    if duplicate_groups > 0 {
+        warnings.push(format!(
+            "{duplicate_groups} cross-source transaction event group(s) were deduplicated in metrics; all source evidence remains in the event ledger."
+        ));
     }
     warnings.push("Net revenue is estimated from webhook payloads and may differ from store payout statements.".to_string());
     Ok(warnings)
@@ -1981,6 +2066,15 @@ fn source_credentials(state: &AppState, encrypted_credentials: Option<&str>) -> 
     Ok(serde_json::from_slice::<Value>(&bytes)?)
 }
 
+fn optional_source_credentials(
+    state: &AppState,
+    encrypted_credentials: Option<&str>,
+) -> ApiResult<Option<Value>> {
+    encrypted_credentials
+        .map(|value| source_credentials(state, Some(value)))
+        .transpose()
+}
+
 fn prepare_source_credentials(
     state: &AppState,
     credentials: Option<Value>,
@@ -2056,13 +2150,14 @@ fn push_optional_filter<'a>(
     column: &str,
     value: Option<impl AsRef<str>>,
 ) {
-    if let Some(value) = value {
-        if !value.as_ref().is_empty() && value.as_ref() != "all" {
-            query.push(" and ");
-            query.push(column);
-            query.push(" = ");
-            query.push_bind(value.as_ref().to_string());
-        }
+    if let Some(value) = value
+        && !value.as_ref().is_empty()
+        && value.as_ref() != "all"
+    {
+        query.push(" and ");
+        query.push(column);
+        query.push(" = ");
+        query.push_bind(value.as_ref().to_string());
     }
 }
 
@@ -2086,6 +2181,11 @@ fn push_event_filters<'a>(
         &format!("{alias}.processing_status"),
         filters.get("processing_status"),
     );
+    push_optional_filter(
+        query,
+        &format!("{alias}.environment"),
+        filters.get("environment"),
+    );
     if let Some(value) = filters.get("source_event_type") {
         push_optional_filter(query, &format!("{alias}.source_event_type"), Some(value));
     }
@@ -2094,25 +2194,27 @@ fn push_event_filters<'a>(
         query.push(alias);
         query.push(".occurred_at::date >= ");
         query.push_bind(from.clone());
+        query.push("::date");
     }
     if let Some(to) = filters.get("to") {
         query.push(" and ");
         query.push(alias);
         query.push(".occurred_at::date <= ");
         query.push_bind(to.clone());
+        query.push("::date");
     }
-    if let Some(q) = filters.get("q") {
-        if !q.is_empty() {
-            query.push(" and (");
-            query.push(alias);
-            query.push(".source_event_id ilike ");
-            query.push_bind(format!("%{q}%"));
-            query.push(" or ");
-            query.push(alias);
-            query.push(".payload::text ilike ");
-            query.push_bind(format!("%{q}%"));
-            query.push(")");
-        }
+    if let Some(q) = filters.get("q")
+        && !q.is_empty()
+    {
+        query.push(" and (");
+        query.push(alias);
+        query.push(".source_event_id ilike ");
+        query.push_bind(format!("%{q}%"));
+        query.push(" or ");
+        query.push(alias);
+        query.push(".payload::text ilike ");
+        query.push_bind(format!("%{q}%"));
+        query.push(")");
     }
 }
 
@@ -2134,6 +2236,7 @@ fn push_normalized_filters<'a>(
     );
     push_optional_filter(query, "ne.country", filters.get("country"));
     push_optional_filter(query, "ne.event_type", filters.get("event_type"));
+    push_optional_filter(query, "ne.environment", filters.get("environment"));
 }
 
 fn push_transaction_filters<'a>(
@@ -2155,14 +2258,17 @@ fn push_transaction_filters<'a>(
     push_optional_filter(query, "t.country", filters.get("country"));
     push_optional_filter(query, "t.currency", filters.get("currency"));
     push_optional_filter(query, "t.status", filters.get("status"));
+    push_optional_filter(query, "t.environment", filters.get("environment"));
     push_optional_filter(query, "t.customer_id", filters.get("customer_id"));
     if let Some(from) = filters.get("from") {
         query.push(" and t.purchase_time::date >= ");
         query.push_bind(from.clone());
+        query.push("::date");
     }
     if let Some(to) = filters.get("to") {
         query.push(" and t.purchase_time::date <= ");
         query.push_bind(to.clone());
+        query.push("::date");
     }
 }
 
@@ -2184,9 +2290,32 @@ fn data_source_json(state: &AppState, row: sqlx::postgres::PgRow) -> ApiResult<V
     let source_type: String = row.try_get("source_type")?;
     let encrypted_credentials: Option<String> = row.try_get("encrypted_credentials")?;
     let has_credentials = encrypted_credentials.is_some();
+    let credential_keys = credential_keys(state, encrypted_credentials.as_deref());
     let has_webhook_secret = row
         .try_get::<Option<String>, _>("webhook_secret_hash")?
         .is_some();
+    let verification_mode = match source_type.as_str() {
+        "app_store"
+            if credential_keys
+                .iter()
+                .any(|key| key == "apple_root_certificates" || key == "apple_root_ca_pem")
+                && credential_keys.iter().any(|key| key == "bundle_id") =>
+        {
+            "apple_jws"
+        }
+        "google_play"
+            if credential_keys
+                .iter()
+                .any(|key| key == "pubsub_oidc_audience")
+                && credential_keys
+                    .iter()
+                    .any(|key| key == "pubsub_service_account_email") =>
+        {
+            "google_oidc"
+        }
+        _ if has_webhook_secret => "shared_secret",
+        _ => "missing",
+    };
     Ok(json!({
         "id": id,
         "workspace_id": row.try_get::<String, _>("workspace_id")?,
@@ -2196,41 +2325,45 @@ fn data_source_json(state: &AppState, row: sqlx::postgres::PgRow) -> ApiResult<V
         "name": row.try_get::<String, _>("name")?,
         "status": row.try_get::<String, _>("status")?,
         "has_credentials": has_credentials,
-        "credential_keys": credential_keys(state, encrypted_credentials.as_deref()),
+        "credential_keys": &credential_keys,
         "has_webhook_secret": has_webhook_secret,
+        "verification_mode": verification_mode,
         "last_event_at": opt_dt(row.try_get::<Option<OffsetDateTime>, _>("last_event_at")?),
         "last_sync_at": opt_dt(row.try_get::<Option<OffsetDateTime>, _>("last_sync_at")?),
         "last_error": row.try_get::<Option<String>, _>("last_error")?,
         "created_at": dt(row.try_get::<OffsetDateTime, _>("created_at")?),
         "updated_at": dt(row.try_get::<OffsetDateTime, _>("updated_at")?),
         "webhook_url": format!("{}/webhooks/{}/{}", state.config.base_url.trim_end_matches('/'), source_type.replace('_', "-"), row.try_get::<String, _>("id")?),
-        "setup_checklist": setup_checklist(&source_type, row.try_get::<Option<OffsetDateTime>, _>("last_event_at")?.is_some(), has_webhook_secret, has_credentials)
+        "setup_checklist": setup_checklist(&source_type, row.try_get::<Option<OffsetDateTime>, _>("last_event_at")?.is_some(), verification_mode, has_credentials)
     }))
 }
 
 fn setup_checklist(
     source_type: &str,
     has_event: bool,
-    has_webhook_secret: bool,
+    verification_mode: &str,
     has_credentials: bool,
 ) -> Vec<Value> {
     match source_type {
         "revenuecat" => vec![
             json!({"key": "webhook_url", "label": "Paste Revtern webhook URL in RevenueCat", "done": true}),
-            json!({"key": "secret", "label": "Configure Authorization/shared secret", "done": has_webhook_secret}),
+            json!({"key": "secret", "label": "Configure Authorization/shared secret", "done": verification_mode == "shared_secret"}),
             json!({"key": "first_event", "label": "Receive first RevenueCat event", "done": has_event}),
         ],
         "app_store" => vec![
             json!({"key": "notifications", "label": "Configure App Store Server Notification URL", "done": true}),
+            json!({"key": "verification", "label": "Configure Apple root certificate and app identity", "done": verification_mode == "apple_jws"}),
             json!({"key": "catch_up", "label": "Configure notification-history catch-up credentials", "done": has_credentials}),
-            json!({"key": "signed_payload", "label": "Decode App Store signedPayload notifications", "done": has_event}),
+            json!({"key": "signed_payload", "label": "Receive and verify a signedPayload notification", "done": has_event}),
         ],
         "google_play" => vec![
             json!({"key": "pubsub", "label": "Configure Pub/Sub push endpoint", "done": true}),
-            json!({"key": "catch_up", "label": "Configure Pub/Sub pull credentials for missed RTDNs", "done": has_credentials}),
+            json!({"key": "verification", "label": "Configure Pub/Sub OIDC audience and service account", "done": verification_mode == "google_oidc" || verification_mode == "shared_secret"}),
+            json!({"key": "store_credentials", "label": "Configure Pub/Sub and Play API credentials", "done": has_credentials}),
             json!({"key": "rtdn", "label": "Receive RTDN message", "done": has_event}),
         ],
         _ => vec![
+            json!({"key": "verification", "label": "Configure a webhook shared secret", "done": verification_mode == "shared_secret"}),
             json!({"key": "webhook", "label": "Send events to the webhook endpoint", "done": has_event}),
             json!({"key": "catalog", "label": "Confirm discovered product catalog", "done": false}),
         ],
@@ -2302,6 +2435,7 @@ fn raw_event_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
         "source_type": row.try_get::<String, _>("source_type")?,
         "source_event_id": row.try_get::<String, _>("source_event_id")?,
         "source_event_type": row.try_get::<Option<String>, _>("source_event_type")?,
+        "environment": row.try_get::<String, _>("environment")?,
         "source_app_id": row.try_get::<Option<String>, _>("source_app_id")?,
         "source_product_id": row.try_get::<Option<String>, _>("source_product_id")?,
         "source_product_name": row.try_get::<Option<String>, _>("source_product_name").ok().flatten(),
@@ -2327,6 +2461,7 @@ fn normalized_event_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
         "logical_product_id": row.try_get::<Option<String>, _>("logical_product_id")?,
         "logical_product_name": row.try_get::<Option<String>, _>("logical_product_name").ok().flatten(),
         "event_type": row.try_get::<String, _>("event_type")?,
+        "environment": row.try_get::<String, _>("environment")?,
         "platform": row.try_get::<Option<String>, _>("platform")?,
         "customer_key": row.try_get::<Option<String>, _>("customer_key")?,
         "transaction_key": row.try_get::<Option<String>, _>("transaction_key")?,
@@ -2356,6 +2491,7 @@ fn transaction_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
         "transaction_key": row.try_get::<String, _>("transaction_key")?,
         "original_transaction_key": row.try_get::<Option<String>, _>("original_transaction_key")?,
         "source_type": row.try_get::<String, _>("source_type")?,
+        "environment": row.try_get::<String, _>("environment")?,
         "purchase_time": dt(row.try_get::<OffsetDateTime, _>("purchase_time")?),
         "amount_minor": row.try_get::<i64, _>("amount_minor")?,
         "currency": row.try_get::<String, _>("currency")?,
@@ -2385,6 +2521,7 @@ fn subscription_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
         "platform": row.try_get::<Option<String>, _>("platform")?,
         "subscription_key": row.try_get::<String, _>("subscription_key")?,
         "original_transaction_key": row.try_get::<Option<String>, _>("original_transaction_key")?,
+        "environment": row.try_get::<String, _>("environment")?,
         "status": row.try_get::<String, _>("status")?,
         "started_at": dt(row.try_get::<OffsetDateTime, _>("started_at")?),
         "current_period_start": opt_dt(row.try_get::<Option<OffsetDateTime>, _>("current_period_start")?),
@@ -2395,6 +2532,7 @@ fn subscription_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
         "in_grace_period": row.try_get::<bool, _>("in_grace_period")?,
         "in_billing_retry": row.try_get::<bool, _>("in_billing_retry")?,
         "latest_transaction_id": row.try_get::<Option<String>, _>("latest_transaction_id")?,
+        "status_updated_at": dt(row.try_get::<OffsetDateTime, _>("status_updated_at")?),
         "updated_at": dt(row.try_get::<OffsetDateTime, _>("updated_at")?),
     }))
 }
@@ -2403,6 +2541,7 @@ fn compact_event_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
     Ok(json!({
         "id": row.try_get::<String, _>("id")?,
         "event_type": row.try_get::<String, _>("event_type")?,
+        "environment": row.try_get::<String, _>("environment")?,
         "occurred_at": dt(row.try_get::<OffsetDateTime, _>("occurred_at")?),
         "raw_event_id": row.try_get::<String, _>("raw_event_id")?,
         "amount_minor": row.try_get::<Option<i64>, _>("amount_minor").ok().flatten(),

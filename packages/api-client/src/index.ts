@@ -13,8 +13,10 @@ import type {
   SetupStatus,
   SourceProductRecord,
   SubscriptionRecord,
+  SubscriptionDetailResponse,
   SyncRunRecord,
   TransactionRecord,
+  TransactionDetailResponse,
 } from "@revtern/types";
 
 export class ApiError extends Error {
@@ -128,8 +130,16 @@ export class RevternApi {
     return this.get<{ transactions: TransactionRecord[] }>(`/api/transactions${query(params)}`);
   }
 
+  transaction(id: Id) {
+    return this.get<TransactionDetailResponse>(`/api/transactions/${id}`);
+  }
+
   subscriptions(params: Record<string, string | undefined> = {}) {
     return this.get<{ subscriptions: SubscriptionRecord[] }>(`/api/subscriptions${query(params)}`);
+  }
+
+  subscription(id: Id) {
+    return this.get<SubscriptionDetailResponse>(`/api/subscriptions/${id}`);
   }
 
   overview(params: Record<string, string | undefined> = {}) {

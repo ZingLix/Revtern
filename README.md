@@ -67,14 +67,17 @@ The first useful version should support:
 - Custom API webhook: usable for custom backend purchase/refund/renewal events.
 - App Store Server Notifications V2: accepts `signedPayload`, decodes the
   notification JWS and nested transaction/renewal JWS payloads, stores the raw
-  source payload unchanged, and projects decoded lifecycle events. Apple
-  certificate-chain validation is still hardening work. Missed notification
-  catch-up pulls App Store notification history and stores the returned
-  `signedPayload` as the same raw webhook shape.
+  source payload unchanged, and projects decoded lifecycle events. Incoming
+  JWS signatures and their `x5c` certificate chains are verified against the
+  configured Apple root certificate before storage; bundle id, environment,
+  and production app Apple id claims are also checked. Missed notification
+  catch-up uses the same verification path.
 - Google Play RTDN: accepts Cloud Pub/Sub push messages, decodes the base64
   `DeveloperNotification`, stores the raw source payload unchanged, and
-  projects lifecycle events from the webhook payload. Missed RTDN catch-up pulls
-  retained Pub/Sub messages only; it does not query Play purchase status.
+  projects lifecycle events from the webhook payload. Pub/Sub push OIDC validates
+  the configured audience and service-account email. Android Publisher lookup
+  classifies test purchases and supplies the per-renewal order id when available.
+  Missed RTDN catch-up pulls retained Pub/Sub messages only.
 
 ## Non-Goals
 
@@ -116,8 +119,11 @@ For Vite hot reload, run the API and web dev server separately:
 
 ```bash
 REVTERN_BIND=127.0.0.1:3001 cargo run -p revtern-api
-VITE_API_BASE_URL=http://localhost:3001 npm run dev:web
+npm run dev:web
 ```
+
+The Vite server proxies `/api` and `/webhooks` to `http://127.0.0.1:3001`
+by default. Set `VITE_API_BASE_URL` only when the API is running elsewhere.
 
 Useful checks:
 
@@ -127,9 +133,19 @@ npm run typecheck -w @revtern/web
 npm run build -w @revtern/web
 ```
 
+`/healthz` is the process liveness endpoint. `/readyz` also checks Postgres and
+is used by the container health check.
+
 After first-run setup, the Overview page includes a demo seed action so the
 dashboard, product mapping, transactions, events, and reconciliation screens can
 be exercised before real webhooks arrive.
+
+App Store events are classified as production or sandbox from Apple payload
+environment fields. Google Play RTDN uses the same webhook for test and
+production purchases, so Revtern receives RTDNs without extra configuration but
+needs Android Publisher API access on the configured service account to verify
+each purchase token as production or test. Unverified Google purchases are
+marked `unknown` and excluded from production revenue metrics.
 
 ## Repository Shape
 

@@ -73,6 +73,7 @@ export interface DataSourceRecord {
   has_credentials: boolean;
   credential_keys: string[];
   has_webhook_secret: boolean;
+  verification_mode: "apple_jws" | "google_oidc" | "shared_secret" | "missing" | string;
   last_event_at?: string | null;
   last_sync_at?: string | null;
   last_error?: string | null;
@@ -139,6 +140,7 @@ export interface RawEventRecord {
   source_type: SourceType;
   source_event_id: string;
   source_event_type?: string | null;
+  environment: string;
   source_app_id?: string | null;
   source_product_id?: Id | null;
   source_product_name?: string | null;
@@ -162,6 +164,7 @@ export interface NormalizedEventRecord {
   logical_product_id?: Id | null;
   logical_product_name?: string | null;
   event_type: string;
+  environment: string;
   platform?: string | null;
   customer_key?: string | null;
   transaction_key?: string | null;
@@ -189,6 +192,7 @@ export interface TransactionRecord {
   transaction_key: string;
   original_transaction_key?: string | null;
   source_type: SourceType;
+  environment: string;
   purchase_time: string;
   amount_minor: number;
   currency: string;
@@ -216,6 +220,7 @@ export interface SubscriptionRecord {
   platform?: string | null;
   subscription_key: string;
   original_transaction_key?: string | null;
+  environment: string;
   status: string;
   started_at: string;
   current_period_start?: string | null;
@@ -226,7 +231,29 @@ export interface SubscriptionRecord {
   in_grace_period: boolean;
   in_billing_retry: boolean;
   latest_transaction_id?: Id | null;
+  status_updated_at: string;
   updated_at: string;
+}
+
+export interface EvidenceEventRecord {
+  id: Id;
+  event_type: string;
+  environment: string;
+  occurred_at: string;
+  raw_event_id: Id;
+  amount_minor?: number | null;
+  currency?: string | null;
+  warnings: string[];
+}
+
+export interface TransactionDetailResponse {
+  transaction: TransactionRecord;
+  events: EvidenceEventRecord[];
+}
+
+export interface SubscriptionDetailResponse {
+  subscription: SubscriptionRecord;
+  timeline: EvidenceEventRecord[];
 }
 
 export interface SyncRunRecord {

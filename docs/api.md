@@ -140,19 +140,21 @@ Request:
 }
 ```
 
-Webhook secrets are stored as hashes. Non-secret credentials are only used for
-missed-webhook catch-up, such as App Store notification history or Google
-Pub/Sub pull backlog.
-
-Catch-up credentials are optional. A source can receive live webhooks without
-them; catch-up is available after credentials are saved.
+Webhook secrets are stored as hashes. Remaining credential fields are encrypted.
+App Store live ingestion requires `bundle_id`, `environment`, an Apple root
+certificate (`apple_root_ca_pem` or `apple_root_certificates`), and
+`app_apple_id` for production. Google Pub/Sub OIDC uses
+`pubsub_oidc_audience` and `pubsub_service_account_email`. API keys and service
+account fields additionally enable notification catch-up and Play purchase
+lookup.
 
 ### PATCH /api/data-sources/{source_id}/credentials
 
-Saves or replaces optional catch-up credentials for an existing source. The same
+Saves or replaces verification, lookup, and catch-up credentials for an existing source. The same
 `webhook_secret`, `authorization`, and `shared_secret` fields are treated as
 webhook secrets and stored as hashes; remaining fields are encrypted as catch-up
-credentials.
+credentials. Send the complete credential object when updating; encrypted fields
+are replaced as one unit.
 
 ## Products
 
@@ -232,13 +234,18 @@ Behavior:
   bodies.
 - Google Play pulls retained Pub/Sub RTDN messages and stores Pub/Sub push-shaped
   bodies.
-- No purchase status, subscription state, order detail, sales report, or finance
-  report endpoint is called.
+- Catch-up itself does not import purchase history, sales reports, or finance
+  reports. After a Google RTDN is recovered, the normal Android Publisher lookup
+  may verify that notification's purchase environment, order id, and amount.
 
 ## Webhooks
 
 Webhook endpoints should not require browser auth. They use source-specific
 verification.
+
+App Store and Google Play reject unverifiable pushes with `401`. Other webhook
+sources reject a bad secret when a shared secret is configured and expose
+unsigned events as unverified when no provider-specific verifier exists.
 
 ```text
 POST /webhooks/revenuecat/{source_id}
@@ -274,6 +281,7 @@ Filters:
 - `app_id`
 - `source_event_type`
 - `processing_status`
+- `environment`
 - `q`
 
 ### GET /api/events/raw/{event_id}
@@ -303,6 +311,7 @@ Filters:
 - `country`
 - `currency`
 - `status`
+- `environment`
 - `customer_id`
 
 ### GET /api/transactions/{transaction_id}
@@ -319,6 +328,7 @@ Filters:
 - `status`
 - `app_id`
 - `platform`
+- `environment`
 - `logical_product_id`
 - `source_product_id`
 - `country`
@@ -328,6 +338,11 @@ Filters:
 Returns subscription timeline.
 
 ## Metrics
+
+Revenue and subscription metrics count only rows with
+`environment = "production"`. Sandbox, test, and unverified `unknown` purchases
+remain visible in event, transaction, and subscription APIs but are excluded
+from production revenue metrics.
 
 ### GET /api/metrics/overview
 

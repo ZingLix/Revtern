@@ -5,6 +5,15 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 
+struct ProjectionContext<'a> {
+    workspace_id: &'a str,
+    app_id: Option<&'a str>,
+    source_product_id: Option<&'a str>,
+    logical_product_id: Option<&'a str>,
+    source_type: &'a str,
+    extracted: &'a ExtractedEvent,
+}
+
 pub async fn enqueue_normalization(pool: &PgPool, raw_event_id: &str) -> Result<String> {
     let id = new_id("job");
     sqlx::query(
@@ -25,7 +34,8 @@ pub async fn process_normalization_job(pool: &PgPool, job_id: &str, worker_id: &
         r#"
         update jobs
         set status = 'running', locked_at = now(), locked_by = $2, attempts = attempts + 1
-        where id = $1 and status in ('queued', 'failed')
+        where id = $1
+          and (status in ('queued', 'failed') or (status = 'running' and locked_at < now() - interval '5 minutes'))
         returning payload
         "#,
     )
@@ -71,6 +81,36 @@ pub async fn process_normalization_job(pool: &PgPool, job_id: &str, worker_id: &
     }
 }
 
+pub async fn process_next_job(pool: &PgPool, worker_id: &str) -> Result<bool> {
+    let job_id: Option<String> = sqlx::query_scalar(
+        r#"
+        select id
+        from jobs
+        where run_after <= now()
+          and (status in ('queued', 'failed') or (status = 'running' and locked_at < now() - interval '5 minutes'))
+        order by run_after asc, created_at asc
+        limit 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(job_id) = job_id else {
+        return Ok(false);
+    };
+    match process_normalization_job(pool, &job_id, worker_id).await {
+        Ok(()) => Ok(true),
+        Err(error)
+            if matches!(
+                error.downcast_ref::<sqlx::Error>(),
+                Some(sqlx::Error::RowNotFound)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub async fn process_raw_event(pool: &PgPool, raw_event_id: &str) -> Result<()> {
     let raw = sqlx::query(
         r#"
@@ -111,51 +151,32 @@ pub async fn process_raw_event(pool: &PgPool, raw_event_id: &str) -> Result<()> 
     };
 
     if let Some(event_type) = extracted.normalized_event_type.as_deref() {
-        let normalized_event_id = insert_normalized_event(
-            pool,
-            &workspace_id,
-            raw_event_id,
-            &data_source_id,
-            app_id.as_deref(),
-            source_product_id.as_deref(),
-            logical_product_id.as_deref(),
-            event_type,
-            &source_type,
-            &extracted,
-        )
-        .await?;
-        project_transaction(
-            pool,
-            &workspace_id,
-            &normalized_event_id,
-            app_id.as_deref(),
-            source_product_id.as_deref(),
-            logical_product_id.as_deref(),
-            &source_type,
-            event_type,
-            &extracted,
-        )
-        .await?;
-        project_subscription(
-            pool,
-            &workspace_id,
-            app_id.as_deref(),
-            source_product_id.as_deref(),
-            logical_product_id.as_deref(),
-            event_type,
-            &extracted,
-        )
-        .await?;
-        update_daily_metric(
-            pool,
-            &workspace_id,
-            app_id.as_deref(),
-            logical_product_id.as_deref(),
-            &source_type,
-            event_type,
-            &extracted,
-        )
-        .await?;
+        let projection = ProjectionContext {
+            workspace_id: &workspace_id,
+            app_id: app_id.as_deref(),
+            source_product_id: source_product_id.as_deref(),
+            logical_product_id: logical_product_id.as_deref(),
+            source_type: &source_type,
+            extracted: &extracted,
+        };
+        let (normalized_event_id, normalized_event_inserted) =
+            insert_normalized_event(pool, raw_event_id, &data_source_id, event_type, &projection)
+                .await?;
+        let transaction_id =
+            project_transaction(pool, &normalized_event_id, event_type, &projection).await?;
+        project_subscription(pool, transaction_id.as_deref(), event_type, &projection).await?;
+        if normalized_event_inserted {
+            update_daily_metric(
+                pool,
+                &workspace_id,
+                app_id.as_deref(),
+                logical_product_id.as_deref(),
+                &source_type,
+                event_type,
+                &extracted,
+            )
+            .await?;
+        }
     }
 
     let status = if extracted.normalized_event_type.is_some() {
@@ -167,16 +188,18 @@ pub async fn process_raw_event(pool: &PgPool, raw_event_id: &str) -> Result<()> 
         r#"
         update raw_events
         set source_event_type = $2,
-            source_app_id = coalesce($3, source_app_id),
-            source_product_id = coalesce($4, source_product_id),
-            occurred_at = $5,
-            processing_status = $6,
+            environment = $3,
+            source_app_id = coalesce($4, source_app_id),
+            source_product_id = coalesce($5, source_product_id),
+            occurred_at = $6,
+            processing_status = $7,
             processing_error = null
         where id = $1
         "#,
     )
     .bind(raw_event_id)
     .bind(&extracted.source_event_type)
+    .bind(&extracted.environment)
     .bind(&extracted.source_app_id)
     .bind(source_product_id.as_deref())
     .bind(extracted.occurred_at)
@@ -197,8 +220,8 @@ async fn resolve_app_id(
         return Ok(app_hint);
     }
 
-    if let Some(source_app_id) = extracted.source_app_id.as_deref() {
-        if let Some(row) = sqlx::query(
+    if let Some(source_app_id) = extracted.source_app_id.as_deref()
+        && let Some(row) = sqlx::query(
             r#"
             select id from apps
             where workspace_id = $1
@@ -210,10 +233,9 @@ async fn resolve_app_id(
         .bind(source_app_id)
         .fetch_optional(pool)
         .await?
-        {
-            let id: String = row.try_get("id")?;
-            return Ok(Some(id));
-        }
+    {
+        let id: String = row.try_get("id")?;
+        return Ok(Some(id));
     }
 
     let row =
@@ -311,41 +333,44 @@ async fn active_logical_product(
 
 async fn insert_normalized_event(
     pool: &PgPool,
-    workspace_id: &str,
     raw_event_id: &str,
     data_source_id: &str,
-    app_id: Option<&str>,
-    source_product_id: Option<&str>,
-    logical_product_id: Option<&str>,
     event_type: &str,
-    _source_type: &str,
-    extracted: &ExtractedEvent,
-) -> Result<String> {
+    projection: &ProjectionContext<'_>,
+) -> Result<(String, bool)> {
+    let ProjectionContext {
+        workspace_id,
+        app_id,
+        source_product_id,
+        logical_product_id,
+        extracted,
+        ..
+    } = projection;
     let id = new_id("ne");
     let warnings = json!(extracted.warnings);
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
         insert into normalized_events (
           id, workspace_id, raw_event_id, data_source_id, app_id, source_product_id, logical_product_id,
           event_type, platform, customer_key, transaction_key, original_transaction_key, subscription_key,
-          amount_minor, currency, country, occurred_at, normalization_version, confidence, warnings, created_at
+          amount_minor, currency, country, occurred_at, environment, normalization_version, confidence, warnings, created_at
         )
         values (
           $1, $2, $3, $4, $5, $6, $7,
           $8, $9, $10, $11, $12, $13,
-          $14, $15, $16, $17, 'mvp_v1', $18, $19, now()
+          $14, $15, $16, $17, $18, 'mvp_v1', $19, $20, now()
         )
-        on conflict (raw_event_id, event_type)
-        do update set warnings = excluded.warnings
+        on conflict (raw_event_id, event_type) do nothing
+        returning id
         "#,
     )
     .bind(&id)
-    .bind(workspace_id)
+    .bind(*workspace_id)
     .bind(raw_event_id)
     .bind(data_source_id)
-    .bind(app_id)
-    .bind(source_product_id)
-    .bind(logical_product_id)
+    .bind(*app_id)
+    .bind(*source_product_id)
+    .bind(*logical_product_id)
     .bind(event_type)
     .bind(&extracted.platform)
     .bind(&extracted.customer_key)
@@ -356,8 +381,34 @@ async fn insert_normalized_event(
     .bind(&extracted.currency)
     .bind(&extracted.country)
     .bind(extracted.occurred_at)
+    .bind(&extracted.environment)
     .bind(if extracted.warnings.is_empty() { 0.92_f64 } else { 0.68_f64 })
-    .bind(warnings)
+    .bind(&warnings)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = inserted {
+        return Ok((row.try_get("id")?, true));
+    }
+
+    sqlx::query(
+        r#"
+        update normalized_events
+        set app_id = coalesce(app_id, $3),
+            source_product_id = coalesce(source_product_id, $4),
+            logical_product_id = coalesce(logical_product_id, $5),
+            environment = $6,
+            warnings = $7
+        where raw_event_id = $1 and event_type = $2
+        "#,
+    )
+    .bind(raw_event_id)
+    .bind(event_type)
+    .bind(*app_id)
+    .bind(*source_product_id)
+    .bind(*logical_product_id)
+    .bind(&extracted.environment)
+    .bind(&warnings)
     .execute(pool)
     .await?;
 
@@ -369,22 +420,25 @@ async fn insert_normalized_event(
     .bind(event_type)
     .fetch_one(pool)
     .await?;
-    row.try_get("id").map_err(Into::into)
+    Ok((row.try_get("id")?, false))
 }
 
 async fn project_transaction(
     pool: &PgPool,
-    workspace_id: &str,
     normalized_event_id: &str,
-    app_id: Option<&str>,
-    source_product_id: Option<&str>,
-    logical_product_id: Option<&str>,
-    source_type: &str,
     event_type: &str,
-    extracted: &ExtractedEvent,
-) -> Result<()> {
+    projection: &ProjectionContext<'_>,
+) -> Result<Option<String>> {
+    let ProjectionContext {
+        workspace_id,
+        app_id,
+        source_product_id,
+        logical_product_id,
+        source_type,
+        extracted,
+    } = projection;
     if !is_revenue_event(event_type) && !is_refund_event(event_type) {
-        return Ok(());
+        return Ok(None);
     }
 
     let transaction_key = extracted
@@ -404,39 +458,49 @@ async fn project_transaction(
         r#"
         insert into transactions (
           id, workspace_id, app_id, source_product_id, logical_product_id, customer_id,
-          platform, transaction_key, original_transaction_key, source_type, purchase_time,
+          platform, transaction_key, original_transaction_key, source_type, environment, purchase_time,
           amount_minor, currency, country, status, source_status, status_reason, status_updated_at,
           refunded_at, refund_amount_minor, created_from_event_id, latest_event_id, updated_at
         )
         values (
           $1, $2, $3, $4, $5, null,
-          $6, $7, $8, $9, $10,
-          $11, $12, $13, $14, $15, null, now(),
-          $16, $17, $18, $18, now()
+          $6, $7, $8, $9, $10, $11,
+          $12, $13, $14, $15, $16, null, $20,
+          $17, $18, $19, $19, now()
         )
         on conflict (workspace_id, source_type, transaction_key)
         do update set
-          status = excluded.status,
-          source_status = excluded.source_status,
-          status_updated_at = now(),
+          environment = excluded.environment,
+          purchase_time = least(transactions.purchase_time, excluded.purchase_time),
+          amount_minor = case when transactions.amount_minor = 0 then excluded.amount_minor else transactions.amount_minor end,
+          currency = case when transactions.currency = 'UNKNOWN' then excluded.currency else transactions.currency end,
+          country = coalesce(transactions.country, excluded.country),
+          status = case when excluded.status_updated_at >= transactions.status_updated_at then excluded.status else transactions.status end,
+          source_status = case when excluded.status_updated_at >= transactions.status_updated_at then excluded.source_status else transactions.source_status end,
+          status_updated_at = greatest(transactions.status_updated_at, excluded.status_updated_at),
           refunded_at = coalesce(excluded.refunded_at, transactions.refunded_at),
-          refund_amount_minor = coalesce(excluded.refund_amount_minor, transactions.refund_amount_minor),
-          latest_event_id = excluded.latest_event_id,
+          refund_amount_minor = case
+            when excluded.refund_amount_minor is null then transactions.refund_amount_minor
+            when transactions.latest_event_id = excluded.latest_event_id then transactions.refund_amount_minor
+            else coalesce(transactions.refund_amount_minor, 0) + excluded.refund_amount_minor
+          end,
+          latest_event_id = case when excluded.status_updated_at >= transactions.status_updated_at then excluded.latest_event_id else transactions.latest_event_id end,
           logical_product_id = coalesce(transactions.logical_product_id, excluded.logical_product_id),
           updated_at = now()
         returning id
         "#,
     )
     .bind(new_id("txn"))
-    .bind(workspace_id)
-    .bind(app_id)
-    .bind(source_product_id)
-    .bind(logical_product_id)
+    .bind(*workspace_id)
+    .bind(*app_id)
+    .bind(*source_product_id)
+    .bind(*logical_product_id)
     .bind(&extracted.platform)
     .bind(&transaction_key)
     .bind(&extracted.original_transaction_key)
-    .bind(source_type)
-    .bind(extracted.occurred_at)
+    .bind(*source_type)
+    .bind(&extracted.environment)
+    .bind(extracted.purchase_time.unwrap_or(extracted.occurred_at))
     .bind(amount)
     .bind(currency)
     .bind(&extracted.country)
@@ -445,6 +509,7 @@ async fn project_transaction(
     .bind(if is_refund_event(event_type) { Some(extracted.occurred_at) } else { None })
     .bind(if is_refund_event(event_type) { Some(amount.abs()) } else { None })
     .bind(normalized_event_id)
+    .bind(extracted.occurred_at)
     .fetch_one(pool)
     .await?;
     let transaction_id: String = row.try_get("id")?;
@@ -470,25 +535,30 @@ async fn project_transaction(
             where id = $3
             "#,
         )
-        .bind(workspace_id)
+        .bind(*workspace_id)
         .bind(customer_key)
         .bind(&transaction_id)
         .execute(pool)
         .await?;
     }
 
-    Ok(())
+    Ok(Some(transaction_id))
 }
 
 async fn project_subscription(
     pool: &PgPool,
-    workspace_id: &str,
-    app_id: Option<&str>,
-    source_product_id: Option<&str>,
-    logical_product_id: Option<&str>,
+    latest_transaction_id: Option<&str>,
     event_type: &str,
-    extracted: &ExtractedEvent,
+    projection: &ProjectionContext<'_>,
 ) -> Result<()> {
+    let ProjectionContext {
+        workspace_id,
+        app_id,
+        source_product_id,
+        logical_product_id,
+        source_type,
+        extracted,
+    } = projection;
     if extracted.product_kind != "subscription"
         && !matches!(
             event_type,
@@ -498,6 +568,7 @@ async fn project_subscription(
                 | "expiration"
                 | "billing_issue"
                 | "grace_period_started"
+                | "grace_period_ended"
                 | "reactivation"
         )
     {
@@ -517,6 +588,7 @@ async fn project_subscription(
         "expiration" => "expired",
         "billing_issue" => "billing_retry",
         "grace_period_started" => "grace_period",
+        "grace_period_ended" | "reactivation" => "active",
         "refund" | "revocation" => "refunded",
         _ => "active",
     };
@@ -524,46 +596,84 @@ async fn project_subscription(
         r#"
         insert into subscriptions (
           id, workspace_id, app_id, source_product_id, logical_product_id, customer_id,
-          platform, subscription_key, original_transaction_key, status, started_at,
+          platform, subscription_key, original_transaction_key, environment, status, started_at,
           current_period_start, current_period_end, cancelled_at, expired_at, will_renew,
-          in_grace_period, in_billing_retry, latest_transaction_id, updated_at
+          in_grace_period, in_billing_retry, latest_transaction_id, status_updated_at, updated_at
         )
         values (
           $1, $2, $3, $4, $5, null,
-          $6, $7, $8, $9, $10,
-          $10, null, $11, $12, $13,
-          $14, $15, null, now()
+          $6, $7, $8, $9, $10, $11,
+          $12, $13, $14, $15, $16,
+          $17, $18, $19, $20, now()
         )
         on conflict (workspace_id, subscription_key)
         do update set
-          status = excluded.status,
+          environment = excluded.environment,
+          status = case when excluded.status_updated_at >= subscriptions.status_updated_at then excluded.status else subscriptions.status end,
+          status_updated_at = greatest(subscriptions.status_updated_at, excluded.status_updated_at),
           source_product_id = coalesce(subscriptions.source_product_id, excluded.source_product_id),
           logical_product_id = coalesce(subscriptions.logical_product_id, excluded.logical_product_id),
+          started_at = least(subscriptions.started_at, excluded.started_at),
+          current_period_start = case when excluded.status_updated_at >= subscriptions.status_updated_at then coalesce(excluded.current_period_start, subscriptions.current_period_start) else subscriptions.current_period_start end,
+          current_period_end = case when excluded.status_updated_at >= subscriptions.status_updated_at then coalesce(excluded.current_period_end, subscriptions.current_period_end) else subscriptions.current_period_end end,
           cancelled_at = coalesce(excluded.cancelled_at, subscriptions.cancelled_at),
           expired_at = coalesce(excluded.expired_at, subscriptions.expired_at),
-          will_renew = excluded.will_renew,
-          in_grace_period = excluded.in_grace_period,
-          in_billing_retry = excluded.in_billing_retry,
+          will_renew = case when excluded.status_updated_at >= subscriptions.status_updated_at then excluded.will_renew else subscriptions.will_renew end,
+          in_grace_period = case when excluded.status_updated_at >= subscriptions.status_updated_at then excluded.in_grace_period else subscriptions.in_grace_period end,
+          in_billing_retry = case when excluded.status_updated_at >= subscriptions.status_updated_at then excluded.in_billing_retry else subscriptions.in_billing_retry end,
+          latest_transaction_id = case when excluded.status_updated_at >= subscriptions.status_updated_at then coalesce(excluded.latest_transaction_id, subscriptions.latest_transaction_id) else subscriptions.latest_transaction_id end,
           updated_at = now()
         "#,
     )
     .bind(new_id("sub"))
-    .bind(workspace_id)
-    .bind(app_id)
-    .bind(source_product_id)
-    .bind(logical_product_id)
+    .bind(*workspace_id)
+    .bind(*app_id)
+    .bind(*source_product_id)
+    .bind(*logical_product_id)
     .bind(&extracted.platform)
-    .bind(subscription_key)
+    .bind(&subscription_key)
     .bind(&extracted.original_transaction_key)
+    .bind(&extracted.environment)
     .bind(status)
-    .bind(extracted.occurred_at)
+    .bind(extracted.purchase_time.unwrap_or(extracted.occurred_at))
+    .bind(extracted.period_start.or(extracted.purchase_time))
+    .bind(extracted.period_end)
     .bind(if event_type == "cancellation" { Some(extracted.occurred_at) } else { None })
     .bind(if event_type == "expiration" { Some(extracted.occurred_at) } else { None })
-    .bind(!matches!(event_type, "cancellation" | "expiration"))
+    .bind(extracted.will_renew.unwrap_or(!matches!(event_type, "cancellation" | "expiration")))
     .bind(event_type == "grace_period_started")
     .bind(event_type == "billing_issue")
+    .bind(latest_transaction_id)
+    .bind(extracted.occurred_at)
     .execute(pool)
     .await?;
+
+    if let Some(customer_key) = extracted.customer_key.as_deref() {
+        upsert_customer(
+            pool,
+            workspace_id,
+            customer_key,
+            source_type,
+            extracted.occurred_at,
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            update subscriptions
+            set customer_id = (
+              select id from customers
+              where workspace_id = $1 and customer_identity_key = $2
+              limit 1
+            )
+            where workspace_id = $1 and subscription_key = $3
+            "#,
+        )
+        .bind(*workspace_id)
+        .bind(customer_key)
+        .bind(&subscription_key)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -576,6 +686,10 @@ async fn update_daily_metric(
     event_type: &str,
     extracted: &ExtractedEvent,
 ) -> Result<()> {
+    if extracted.environment != "production" {
+        return Ok(());
+    }
+
     let currency = extracted.currency.as_deref().unwrap_or("UNKNOWN");
     let gross = if is_revenue_event(event_type) {
         extracted.amount_minor.unwrap_or(0)

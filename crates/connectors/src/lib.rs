@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 pub struct ExtractedEvent {
     pub source_event_id: String,
     pub source_event_type: String,
+    pub environment: String,
     pub source_app_id: Option<String>,
     pub source_product_key: Option<String>,
     pub external_product_id: Option<String>,
@@ -31,6 +32,10 @@ pub struct ExtractedEvent {
     pub original_transaction_key: Option<String>,
     pub subscription_key: Option<String>,
     pub occurred_at: OffsetDateTime,
+    pub purchase_time: Option<OffsetDateTime>,
+    pub period_start: Option<OffsetDateTime>,
+    pub period_end: Option<OffsetDateTime>,
+    pub will_renew: Option<bool>,
     pub warnings: Vec<String>,
 }
 
@@ -86,6 +91,7 @@ fn extract_revenuecat(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         source_event_id: pick_string(event, &["id", "event_id", "transaction_id"])
             .unwrap_or_else(|| fallback_id.to_string()),
         source_event_type: event_type_raw,
+        environment: event_environment(event).unwrap_or_else(|| "production".to_string()),
         source_app_id,
         source_product_key,
         external_product_id: product_id.clone(),
@@ -118,6 +124,10 @@ fn extract_revenuecat(payload: &Value, fallback_id: &str) -> ExtractedEvent {
             &["original_transaction_id", "subscription_id", "app_user_id"],
         ),
         occurred_at,
+        purchase_time: pick_optional_time(event, &["purchased_at_ms", "purchased_at"]),
+        period_start: pick_optional_time(event, &["purchased_at_ms", "period_start"]),
+        period_end: pick_optional_time(event, &["expiration_at_ms", "expires_at_ms", "period_end"]),
+        will_renew: pick_bool(event, &["will_renew"]),
         warnings: vec![],
     }
 }
@@ -142,6 +152,7 @@ fn extract_custom(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         source_event_id: pick_string(payload, &["event_id", "id", "transaction_id"])
             .unwrap_or_else(|| fallback_id.to_string()),
         source_event_type: event_type_raw.clone(),
+        environment: event_environment(payload).unwrap_or_else(|| "unknown".to_string()),
         source_app_id,
         source_product_key,
         external_product_id: product_id.clone(),
@@ -174,6 +185,16 @@ fn extract_custom(payload: &Value, fallback_id: &str) -> ExtractedEvent {
             ],
         ),
         occurred_at: pick_time(payload, &["occurred_at", "event_time", "purchase_time"]),
+        purchase_time: pick_optional_time(
+            payload,
+            &["purchase_time", "purchased_at", "occurred_at"],
+        ),
+        period_start: pick_optional_time(payload, &["current_period_start", "period_start"]),
+        period_end: pick_optional_time(
+            payload,
+            &["current_period_end", "period_end", "expires_at"],
+        ),
+        will_renew: pick_bool(payload, &["will_renew", "auto_renewing"]),
         warnings: vec![],
     }
 }
@@ -205,7 +226,9 @@ fn extract_app_store(payload: &Value, fallback_id: &str) -> ExtractedEvent {
     let event_type_raw = pick_string(notification, &["notificationType", "notification_type"])
         .or_else(|| pick_string(data, &["notificationType", "type"]))
         .unwrap_or_else(|| "UNKNOWN".to_string());
-    let source_event_type = pick_string(notification, &["subtype"])
+    let subtype = pick_string(notification, &["subtype"]);
+    let source_event_type = subtype
+        .clone()
         .map(|subtype| format!("{event_type_raw}.{subtype}"))
         .unwrap_or_else(|| event_type_raw.clone());
     let product_id = pick_string(transaction, &["productId", "product_id"]);
@@ -227,6 +250,10 @@ fn extract_app_store(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         .unwrap_or_else(|| {
             infer_product_kind(&event_type_raw, product_id.as_deref().unwrap_or(""))
         });
+    let environment = event_environment(notification)
+        .or_else(|| event_environment(data))
+        .or_else(|| event_environment(transaction))
+        .unwrap_or_else(|| "unknown".to_string());
     let mut warnings = vec![];
     if payload.get("signedPayload").is_some() {
         warnings.push(
@@ -242,6 +269,9 @@ fn extract_app_store(payload: &Value, fallback_id: &str) -> ExtractedEvent {
             "App Store signedTransactionInfo could not be decoded as compact JWS.".to_string(),
         );
     }
+    if environment == "unknown" {
+        warnings.push("App Store payload did not include an environment field.".to_string());
+    }
 
     ExtractedEvent {
         source_event_id: pick_string(
@@ -251,6 +281,7 @@ fn extract_app_store(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         .or_else(|| pick_string(transaction, &["transactionId", "transaction_id"]))
         .unwrap_or_else(|| fallback_id.to_string()),
         source_event_type,
+        environment,
         source_app_id: bundle_id,
         source_product_key,
         external_product_id: product_id.clone(),
@@ -260,7 +291,7 @@ fn extract_app_store(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         product_kind,
         billing_period: infer_billing_period(product_id.as_deref().unwrap_or("")),
         platform: Some("ios".to_string()),
-        normalized_event_type: map_app_store_type(&event_type_raw),
+        normalized_event_type: map_app_store_type(&event_type_raw, subtype.as_deref()),
         amount_minor: apple_price_minor(transaction)
             .or_else(|| pick_money(transaction, &["amount_minor", "amount"])),
         currency: pick_string(transaction, &["currency"]),
@@ -275,11 +306,23 @@ fn extract_app_store(payload: &Value, fallback_id: &str) -> ExtractedEvent {
             transaction,
             &["originalTransactionId", "original_transaction_id"],
         ),
-        occurred_at: pick_time(
-            transaction,
-            &["purchaseDate", "purchase_date", "signedDate", "expiresDate"],
+        occurred_at: pick_optional_time(notification, &["signedDate"])
+            .or_else(|| {
+                pick_optional_time(transaction, &["signedDate", "purchaseDate", "expiresDate"])
+            })
+            .unwrap_or_else(OffsetDateTime::now_utc),
+        purchase_time: pick_optional_time(transaction, &["purchaseDate", "originalPurchaseDate"]),
+        period_start: pick_optional_time(transaction, &["purchaseDate"]),
+        period_end: pick_optional_time(transaction, &["expiresDate", "revocationDate"]),
+        will_renew: pick_string(
+            decoded_renewal.as_ref().unwrap_or(data),
+            &["autoRenewStatus"],
         )
-        .max(pick_time(notification, &["signedDate"])),
+        .and_then(|value| match value.as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        }),
         warnings,
     }
 }
@@ -289,12 +332,26 @@ fn extract_google_play(payload: &Value, fallback_id: &str) -> ExtractedEvent {
     let source = decoded.as_object().map(|_| &decoded).unwrap_or(payload);
     let subscription = source.get("subscriptionNotification");
     let one_time = source.get("oneTimeProductNotification");
+    let test_notification = source.get("testNotification");
     let event = subscription.or(one_time).unwrap_or(source);
     let event_type_raw = pick_string(event, &["notificationType", "event_type", "type"])
         .unwrap_or_else(|| "UNKNOWN".to_string());
-    let product_id = pick_string(event, &["subscriptionId", "sku", "productId", "product_id"]);
+    let lookup = source.get("googlePlayPurchaseLookup");
+    let product_id = pick_string(event, &["subscriptionId", "sku", "productId", "product_id"])
+        .or_else(|| lookup.and_then(|value| pick_string(value, &["product_id"])));
     let package_name = pick_string(source, &["packageName", "package_name"]);
-    let base_plan_id = pick_string(event, &["basePlanId", "base_plan_id"]);
+    let base_plan_id = pick_string(event, &["basePlanId", "base_plan_id"])
+        .or_else(|| lookup.and_then(|value| pick_string(value, &["base_plan_id"])));
+    let environment = lookup
+        .and_then(event_environment)
+        .or_else(|| {
+            if test_notification.is_some() {
+                Some("test".to_string())
+            } else {
+                event_environment(source)
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     let source_product_key = product_id.as_deref().map(|id| {
         source_product_key(
             "google_play",
@@ -303,8 +360,10 @@ fn extract_google_play(payload: &Value, fallback_id: &str) -> ExtractedEvent {
             base_plan_id.as_deref(),
         )
     });
-    let amount_minor = pick_money(source, &["amount_minor", "price"]);
-    let currency = pick_string(source, &["currency"]);
+    let amount_minor = pick_money(source, &["amount_minor", "price"])
+        .or_else(|| lookup.and_then(|value| pick_money(value, &["amount_minor"])));
+    let currency = pick_string(source, &["currency"])
+        .or_else(|| lookup.and_then(|value| pick_string(value, &["currency"])));
     let mut warnings = vec![];
     if amount_minor.is_none() {
         warnings.push(
@@ -317,6 +376,17 @@ fn extract_google_play(payload: &Value, fallback_id: &str) -> ExtractedEvent {
             "Google Play subscription notification did not include a product id.".to_string(),
         );
     }
+    if environment == "unknown" && (subscription.is_some() || one_time.is_some()) {
+        warnings.push(
+            "Google Play RTDN alone does not identify whether this purchase is production or test; configure Android Publisher API access to verify purchase tokens."
+                .to_string(),
+        );
+    }
+    if let Some(error) = lookup.and_then(|value| pick_string(value, &["error"])) {
+        warnings.push(format!(
+            "Google Play purchase environment lookup failed: {error}"
+        ));
+    }
 
     ExtractedEvent {
         source_event_id: pick_string(
@@ -327,6 +397,7 @@ fn extract_google_play(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         .or_else(|| pick_string(event, &["purchaseToken", "purchase_token"]))
         .unwrap_or_else(|| fallback_id.to_string()),
         source_event_type: event_type_raw.clone(),
+        environment,
         source_app_id: package_name,
         source_product_key,
         external_product_id: product_id.clone(),
@@ -340,21 +411,33 @@ fn extract_google_play(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         },
         billing_period: infer_billing_period(product_id.as_deref().unwrap_or("")),
         platform: Some("android".to_string()),
-        normalized_event_type: map_google_type(&event_type_raw),
+        normalized_event_type: map_google_type(
+            &event_type_raw,
+            subscription.is_some(),
+            one_time.is_some(),
+        ),
         amount_minor,
         currency,
-        country: pick_string(source, &["country", "regionCode"]),
-        customer_key: pick_string(source, &["obfuscatedExternalAccountId", "customer_id"]),
-        transaction_key: pick_string(
-            event,
-            &["purchaseToken", "purchase_token", "orderId", "order_id"],
+        country: pick_string(source, &["country", "regionCode"])
+            .or_else(|| lookup.and_then(|value| pick_string(value, &["region_code"]))),
+        customer_key: pick_string(source, &["obfuscatedExternalAccountId", "customer_id"]).or_else(
+            || lookup.and_then(|value| pick_string(value, &["obfuscated_external_account_id"])),
         ),
+        transaction_key: lookup
+            .and_then(|value| pick_string(value, &["order_id"]))
+            .or_else(|| pick_string(event, &["orderId", "order_id"]))
+            .or_else(|| pick_string(event, &["purchaseToken", "purchase_token"])),
         original_transaction_key: pick_string(event, &["purchaseToken", "purchase_token"]),
         subscription_key: pick_string(event, &["purchaseToken", "purchase_token"]),
         occurred_at: pick_time(
             source,
             &["eventTimeMillis", "event_time_millis", "occurred_at"],
         ),
+        purchase_time: lookup
+            .and_then(|value| pick_optional_time(value, &["purchase_time", "start_time"])),
+        period_start: lookup.and_then(|value| pick_optional_time(value, &["start_time"])),
+        period_end: lookup.and_then(|value| pick_optional_time(value, &["expiry_time"])),
+        will_renew: lookup.and_then(|value| pick_bool(value, &["will_renew"])),
         warnings,
     }
 }
@@ -379,6 +462,9 @@ fn extract_stripe(payload: &Value, fallback_id: &str) -> ExtractedEvent {
     ExtractedEvent {
         source_event_id: pick_string(payload, &["id"]).unwrap_or_else(|| fallback_id.to_string()),
         source_event_type: event_type.clone(),
+        environment: event_environment(payload)
+            .or_else(|| event_environment(data))
+            .unwrap_or_else(|| "unknown".to_string()),
         source_app_id: pick_string(payload, &["account"]),
         source_product_key,
         external_product_id: product_id.clone(),
@@ -403,6 +489,11 @@ fn extract_stripe(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         original_transaction_key: None,
         subscription_key: pick_string(data, &["subscription"]),
         occurred_at: pick_time(payload, &["created"]).max(pick_time(data, &["created"])),
+        purchase_time: pick_optional_time(data, &["created", "created_at"]),
+        period_start: pick_optional_time(data, &["period_start", "current_period_start"]),
+        period_end: pick_optional_time(data, &["period_end", "current_period_end"]),
+        will_renew: pick_bool(data, &["will_renew"])
+            .or_else(|| pick_bool(data, &["cancel_at_period_end"]).map(|value| !value)),
         warnings: vec![
             "Stripe connector is webhook-only in this MVP; metrics use the received event payload."
                 .to_string(),
@@ -422,6 +513,9 @@ fn extract_paddle(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         source_event_id: pick_string(payload, &["event_id", "id"])
             .unwrap_or_else(|| fallback_id.to_string()),
         source_event_type: event_type.clone(),
+        environment: event_environment(payload)
+            .or_else(|| event_environment(data))
+            .unwrap_or_else(|| "unknown".to_string()),
         source_app_id: None,
         source_product_key,
         external_product_id: product_id.clone(),
@@ -446,6 +540,13 @@ fn extract_paddle(payload: &Value, fallback_id: &str) -> ExtractedEvent {
         subscription_key: pick_string(data, &["subscription_id", "subscription"]),
         occurred_at: pick_time(payload, &["occurred_at", "event_time"])
             .max(pick_time(data, &["created_at"])),
+        purchase_time: pick_optional_time(data, &["created_at", "billed_at"]),
+        period_start: pick_optional_time(
+            data,
+            &["current_billing_period.starts_at", "period_start"],
+        ),
+        period_end: pick_optional_time(data, &["current_billing_period.ends_at", "period_end"]),
+        will_renew: pick_bool(data, &["will_renew", "scheduled_change"]),
         warnings: vec![
             "Paddle connector is webhook-only in this MVP; metrics use the received event payload."
                 .to_string(),
@@ -491,10 +592,10 @@ fn pick_money(value: &Value, names: &[&str]) -> Option<i64> {
             .get(*name)
             .or_else(|| value.pointer(&format!("/{}", name.replace('.', "/"))))
         {
-            if name.ends_with("_minor") {
-                if let Some(number) = found.as_i64() {
-                    return Some(number);
-                }
+            if name.ends_with("_minor")
+                && let Some(number) = found.as_i64()
+            {
+                return Some(number);
             }
             if let Some(amount) = normalize_money_minor(found) {
                 return Some(amount);
@@ -505,17 +606,93 @@ fn pick_money(value: &Value, names: &[&str]) -> Option<i64> {
 }
 
 fn pick_time(value: &Value, names: &[&str]) -> OffsetDateTime {
+    pick_optional_time(value, names).unwrap_or_else(OffsetDateTime::now_utc)
+}
+
+fn pick_optional_time(value: &Value, names: &[&str]) -> Option<OffsetDateTime> {
+    for name in names {
+        if let Some(found) = value
+            .get(*name)
+            .or_else(|| value.pointer(&format!("/{}", name.replace('.', "/"))))
+            && let Some(time) = parse_time(found)
+        {
+            return Some(time);
+        }
+    }
+    None
+}
+
+fn pick_bool(value: &Value, names: &[&str]) -> Option<bool> {
     for name in names {
         if let Some(found) = value
             .get(*name)
             .or_else(|| value.pointer(&format!("/{}", name.replace('.', "/"))))
         {
-            if let Some(time) = parse_time(found) {
-                return time;
+            match found {
+                Value::Bool(value) => return Some(*value),
+                Value::Number(value) => return value.as_i64().map(|value| value != 0),
+                Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" => return Some(true),
+                    "false" | "0" | "no" => return Some(false),
+                    _ => {}
+                },
+                _ => {}
             }
         }
     }
-    OffsetDateTime::now_utc()
+    None
+}
+
+fn event_environment(value: &Value) -> Option<String> {
+    for name in [
+        "environment",
+        "env",
+        "store_environment",
+        "source_environment",
+    ] {
+        if let Some(found) = value
+            .get(name)
+            .or_else(|| value.pointer(&format!("/{}", name.replace('.', "/"))))
+        {
+            match found {
+                Value::String(text) => {
+                    if let Some(environment) = normalize_environment(text) {
+                        return Some(environment);
+                    }
+                }
+                Value::Bool(flag) => {
+                    return Some(if *flag { "production" } else { "test" }.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(flag) = value.get("livemode").and_then(Value::as_bool) {
+        return Some(if flag { "production" } else { "test" }.to_string());
+    }
+    if matches!(value.get("sandbox").and_then(Value::as_bool), Some(true)) {
+        return Some("sandbox".to_string());
+    }
+
+    None
+}
+
+fn normalize_environment(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(
+        match normalized.as_str() {
+            "prod" | "production" | "live" | "real" => "production",
+            "sandbox" => "sandbox",
+            "test" | "testing" | "license_test" | "test_purchase" => "test",
+            "unknown" => "unknown",
+            other => other,
+        }
+        .to_string(),
+    )
 }
 
 fn decode_pubsub_data(payload: &Value) -> Option<Value> {
@@ -573,16 +750,25 @@ fn map_revenuecat_type(raw: &str) -> Option<String> {
     )
 }
 
-fn map_app_store_type(raw: &str) -> Option<String> {
+fn map_app_store_type(raw: &str, subtype: Option<&str>) -> Option<String> {
     let upper = raw.to_ascii_uppercase();
+    let subtype = subtype.unwrap_or_default().to_ascii_uppercase();
     Some(
         match upper.as_str() {
-            "SUBSCRIBED" | "DID_RECOVER" => "purchase",
+            "SUBSCRIBED" if subtype == "RESUBSCRIBE" => "reactivation",
+            "SUBSCRIBED" => "purchase",
+            "DID_RECOVER" => "reactivation",
             "DID_RENEW" => "renewal",
-            "DID_CHANGE_RENEWAL_STATUS" | "DID_CHANGE_RENEWAL_PREF" => "cancellation",
+            "DID_CHANGE_RENEWAL_STATUS" if subtype == "AUTO_RENEW_ENABLED" => "reactivation",
+            "DID_CHANGE_RENEWAL_STATUS" if subtype == "AUTO_RENEW_DISABLED" => "cancellation",
+            "DID_CHANGE_RENEWAL_STATUS" => "unknown",
+            "DID_CHANGE_RENEWAL_PREF" => "product_change",
             "EXPIRED" => "expiration",
-            "REFUND" | "REFUND_DECLINED" | "CONSUMPTION_REQUEST" => "refund",
+            "REFUND" => "refund",
+            "REFUND_DECLINED" => "refund_declined",
+            "CONSUMPTION_REQUEST" => "consumption",
             "GRACE_PERIOD_EXPIRED" => "expiration",
+            "DID_FAIL_TO_RENEW" if subtype == "GRACE_PERIOD" => "grace_period_started",
             "DID_FAIL_TO_RENEW" => "billing_issue",
             "REVOKE" => "revocation",
             _ => return Some(map_common_type(raw)),
@@ -591,8 +777,21 @@ fn map_app_store_type(raw: &str) -> Option<String> {
     )
 }
 
-fn map_google_type(raw: &str) -> Option<String> {
+fn map_google_type(raw: &str, is_subscription: bool, is_one_time: bool) -> Option<String> {
     let normalized = raw.to_ascii_lowercase();
+    if is_one_time {
+        return Some(
+            match normalized.as_str() {
+                "1" | "one_time_product_purchased" => "one_time_purchase",
+                "2" | "one_time_product_canceled" => "cancellation",
+                _ => "unknown",
+            }
+            .to_string(),
+        );
+    }
+    if !is_subscription {
+        return Some("unknown".to_string());
+    }
     Some(
         match normalized.as_str() {
             "1" | "subscription_recovered" => "reactivation",
@@ -604,8 +803,6 @@ fn map_google_type(raw: &str) -> Option<String> {
             "7" | "subscription_restarted" => "reactivation",
             "12" | "subscription_revoked" => "revocation",
             "13" | "subscription_expired" => "expiration",
-            "one_time_product_purchased" => "one_time_purchase",
-            "one_time_product_canceled" => "cancellation",
             _ => return Some(map_common_type(raw)),
         }
         .to_string(),
@@ -637,7 +834,97 @@ fn map_common_type(raw: &str) -> String {
     } else if lower.contains("purchase") || lower.contains("paid") || lower.contains("payment") {
         "purchase"
     } else {
-        "purchase"
+        "unknown"
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn google_subscription_renewal_uses_order_id_for_each_charge() {
+        let payload = json!({
+            "packageName": "com.example.app",
+            "eventTimeMillis": "1710000000000",
+            "subscriptionNotification": {
+                "notificationType": 2,
+                "purchaseToken": "shared-purchase-token",
+                "subscriptionId": "pro.monthly"
+            },
+            "googlePlayPurchaseLookup": {
+                "status": "verified",
+                "environment": "production",
+                "order_id": "GPA.1234-5678-9012-34567..2",
+                "start_time": "2024-03-01T00:00:00Z",
+                "expiry_time": "2024-04-01T00:00:00Z",
+                "will_renew": true,
+                "amount_minor": 999,
+                "currency": "USD"
+            }
+        });
+
+        let event = extract_event("google_play", &payload, "fallback");
+        assert_eq!(event.normalized_event_type.as_deref(), Some("renewal"));
+        assert_eq!(
+            event.transaction_key.as_deref(),
+            Some("GPA.1234-5678-9012-34567..2")
+        );
+        assert_eq!(
+            event.subscription_key.as_deref(),
+            Some("shared-purchase-token")
+        );
+        assert_eq!(event.amount_minor, Some(999));
+        assert_eq!(event.environment, "production");
+        assert_eq!(event.will_renew, Some(true));
+        assert!(event.period_end.is_some());
+    }
+
+    #[test]
+    fn app_store_preserves_purchase_time_separately_from_notification_time() {
+        let payload = json!({
+            "notificationType": "DID_RENEW",
+            "notificationUUID": "notification-1",
+            "signedDate": 1710003600000_i64,
+            "data": {
+                "bundleId": "com.example.app",
+                "environment": "Production",
+                "transactionInfo": {
+                    "transactionId": "2000000000001",
+                    "originalTransactionId": "1000000000001",
+                    "productId": "pro.monthly",
+                    "type": "Auto-Renewable Subscription",
+                    "purchaseDate": 1710000000000_i64,
+                    "expiresDate": 1712678400000_i64,
+                    "price": 9990,
+                    "currency": "USD"
+                },
+                "signedRenewalInfo": null
+            }
+        });
+
+        let event = extract_event("app_store", &payload, "fallback");
+        assert_eq!(event.normalized_event_type.as_deref(), Some("renewal"));
+        assert_eq!(event.amount_minor, Some(999));
+        assert_eq!(event.environment, "production");
+        assert_eq!(event.transaction_key.as_deref(), Some("2000000000001"));
+        assert!(event.purchase_time.is_some());
+        assert!(event.period_end.is_some());
+        assert!(event.occurred_at > event.purchase_time.unwrap());
+    }
+
+    #[test]
+    fn non_financial_store_notifications_do_not_create_revenue() {
+        assert_eq!(
+            map_app_store_type("REFUND_DECLINED", None).as_deref(),
+            Some("refund_declined")
+        );
+        assert_eq!(
+            map_google_type("1", false, true).as_deref(),
+            Some("one_time_purchase")
+        );
+        assert_eq!(map_common_type("UNRECOGNIZED_PROVIDER_EVENT"), "unknown");
+    }
 }

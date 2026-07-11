@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
+pub(crate) const GOOGLE_ANDROID_PUBLISHER_SCOPE: &str =
+    "https://www.googleapis.com/auth/androidpublisher";
+const GOOGLE_PUBSUB_SCOPE: &str = "https://www.googleapis.com/auth/pubsub";
+
 #[derive(Debug, Clone)]
 pub struct CatchUpWindow {
     pub from: OffsetDateTime,
@@ -130,7 +134,7 @@ async fn fetch_google_pubsub_messages(
     let access_token = if let Some(token) = optional_string(credentials, "access_token") {
         token.to_string()
     } else {
-        google_access_token(credentials).await?
+        google_access_token(credentials, GOOGLE_PUBSUB_SCOPE).await?
     };
     let client = Client::new();
     let max_messages = window.limit.clamp(1, 100);
@@ -211,7 +215,7 @@ fn app_store_token(
     .context("sign App Store Server API token")
 }
 
-async fn google_access_token(credentials: &Value) -> Result<String> {
+pub(crate) async fn google_access_token(credentials: &Value, scope: &str) -> Result<String> {
     let service_account = service_account_json(credentials)?;
     let client_email = required_string(&service_account, "client_email")?;
     let private_key = required_string(&service_account, "private_key")?.replace("\\n", "\n");
@@ -234,7 +238,7 @@ async fn google_access_token(credentials: &Value) -> Result<String> {
         &Header::new(Algorithm::RS256),
         &Claims {
             iss: &client_email,
-            scope: "https://www.googleapis.com/auth/pubsub",
+            scope,
             aud: token_uri,
             iat: now,
             exp: now + 3600,

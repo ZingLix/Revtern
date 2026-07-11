@@ -11,6 +11,20 @@ export function formatMoney(minor?: number | null, currency = "USD") {
   }
 }
 
+export function formatCompactMoney(minor?: number | null, currency = "USD") {
+  const value = (minor ?? 0) / 100;
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency,
+      notation: "compact",
+      maximumFractionDigits: 1,
+    }).format(value);
+  } catch {
+    return `${currency} ${value.toFixed(0)}`;
+  }
+}
+
 export function formatNumber(value?: number | null) {
   return new Intl.NumberFormat().format(value ?? 0);
 }
@@ -21,7 +35,8 @@ export function formatPercent(value?: number | null) {
 
 export function formatDate(value?: string | null) {
   if (!value) return "—";
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(new Date(value));
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T12:00:00`) : new Date(value);
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
 }
 
 export function formatDateTime(value?: string | null) {

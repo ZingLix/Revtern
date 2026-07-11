@@ -3,7 +3,9 @@ mod catchup;
 mod config;
 mod crypto;
 mod error;
+mod purchase_lookup;
 mod routes;
+mod webhook_verification;
 
 use std::sync::Arc;
 
@@ -16,6 +18,8 @@ use axum::{
     routing::get,
 };
 use config::Config;
+use revtern_core::new_id;
+use revtern_jobs::process_next_job;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
@@ -32,6 +36,8 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
@@ -54,6 +60,21 @@ async fn main() -> anyhow::Result<()> {
         pool,
         config: config.clone(),
     };
+
+    let worker_pool = state.pool.clone();
+    tokio::spawn(async move {
+        let worker_id = new_id("worker");
+        loop {
+            match process_next_job(&worker_pool, &worker_id).await {
+                Ok(true) => continue,
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                Err(error) => {
+                    tracing::error!(?error, "background job failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
 
     let mut app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -79,13 +100,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(TraceLayer::new_for_http());
 
-    if let Some(web_dist) = &config.web_dist {
-        if web_dist.exists() {
-            app = app.fallback_service(
-                ServeDir::new(web_dist)
-                    .not_found_service(ServeFile::new(web_dist.join("index.html"))),
-            );
-        }
+    if let Some(web_dist) = &config.web_dist
+        && web_dist.exists()
+    {
+        app = app.fallback_service(
+            ServeDir::new(web_dist).not_found_service(ServeFile::new(web_dist.join("index.html"))),
+        );
     }
 
     tracing::info!(bind = %config.bind, "starting revtern api");

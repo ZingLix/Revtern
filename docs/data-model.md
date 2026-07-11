@@ -238,6 +238,7 @@ Important fields:
 - `source_type`
 - `source_event_id`
 - `source_event_type`
+- `environment`
 - `source_app_id`
 - `source_product_id`
 - `occurred_at`
@@ -248,11 +249,16 @@ Important fields:
 - `processing_status`
 - `processing_error`
 
+`environment` is one of `production`, `sandbox`, `test`, or `unknown`.
+Production metrics count only `production`. `unknown` means Revtern received the
+event but could not verify whether the underlying purchase is real or test.
+
 Indexes:
 
 - unique `(data_source_id, source_event_id)` where source ids are stable.
 - `(workspace_id, occurred_at)`.
 - `(workspace_id, source_type, source_event_type)`.
+- `(workspace_id, environment, occurred_at)`.
 - `(payload_sha256)` for dedupe support.
 
 ### normalized_events
@@ -269,6 +275,7 @@ Important fields:
 - `source_product_id`
 - `logical_product_id`
 - `event_type`
+- `environment`
 - `platform`
 - `customer_key`
 - `transaction_key`
@@ -335,6 +342,7 @@ Important fields:
 - `transaction_key`
 - `original_transaction_key`
 - `source_type`
+- `environment`
 - `purchase_time`
 - `amount_minor`
 - `currency`
@@ -380,6 +388,7 @@ Important fields:
 - `platform`
 - `subscription_key`
 - `original_transaction_key`
+- `environment`
 - `status`
 - `started_at`
 - `current_period_start`
@@ -390,6 +399,8 @@ Important fields:
 - `in_grace_period`
 - `in_billing_retry`
 - `latest_transaction_id`
+- `status_updated_at` provider event time used to reject stale out-of-order state
+  transitions
 - `updated_at`
 
 `status` examples:
@@ -406,6 +417,12 @@ Important fields:
 ### daily_metrics
 
 Precomputed metrics for dashboard speed.
+
+Normalization updates a daily rollup only when the normalized event is first
+inserted. Retrying the same raw-event job therefore cannot increment revenue or
+counts twice. User-facing metric queries are derived from the normalized event
+ledger so refunds retain their original gross sale and every number can drill
+back to source evidence.
 
 Dimensions:
 
