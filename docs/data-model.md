@@ -14,7 +14,8 @@
 
 ### users
 
-Local Revtern users.
+Local or federated Revtern users. `password_hash` is nullable for OIDC-only and
+reverse-proxy accounts.
 
 Important fields:
 
@@ -23,21 +24,25 @@ Important fields:
 - `password_hash`
 - `display_name`
 - `role`
+- `status`
 - `created_at`
 - `last_login_at`
 
-MVP roles:
+The user-level role describes the account's primary personal workspace. App
+authorization is derived separately from ownership and app memberships.
 
-- `owner`
-- `viewer`
+### auth_providers and auth_identities
 
-For self-host MVP, a single `owner` is enough.
+`auth_providers` stores non-secret OIDC provider metadata. Client secrets remain
+deployment configuration. `auth_identities` binds a stable `(provider_id,
+subject)` pair to a user and stores the latest verified claims for audit and
+display.
 
 ### workspaces
 
-A logical container for apps and data sources.
-
-MVP can create exactly one workspace during first-run setup.
+A logical ownership container. Each normal user receives a personal workspace;
+accepting an app invitation also creates a guest membership in the owner's
+workspace without granting access to its other apps.
 
 Important fields:
 
@@ -53,6 +58,8 @@ Important fields:
 
 - `id`
 - `workspace_id`
+- `owner_user_id`
+- `created_by_user_id`
 - `name`
 - `platform_bundle_id`
 - `apple_bundle_id`
@@ -61,6 +68,22 @@ Important fields:
 
 One Revtern app may map to both iOS and Android identifiers when it is the same
 product across platforms.
+
+### app_roles, app_role_permissions, and app_memberships
+
+Roles group app capabilities. `app_memberships` grants one role to one user for
+one app. Owners and active workspace administrators receive all app
+capabilities through the effective permissions view.
+
+### app_invitations
+
+Email-bound, expiring invitations store only a token hash. Acceptance verifies
+the account email and creates the explicit app membership atomically.
+
+### audit_events
+
+Append-only security and administration events scoped to a user, workspace,
+and app where applicable.
 
 ### data_sources
 
@@ -80,6 +103,7 @@ Important fields:
 
 - `id`
 - `workspace_id`
+- `app_id`
 - `source_type`
 - `name`
 - `status`
@@ -203,6 +227,7 @@ Important fields:
 
 - `id`
 - `workspace_id`
+- `app_id`
 - `source_product_id`
 - `logical_product_id`
 - `mapping_method`
@@ -234,6 +259,7 @@ Important fields:
 
 - `id`
 - `workspace_id`
+- `app_id`
 - `data_source_id`
 - `source_type`
 - `source_event_id`
@@ -256,9 +282,9 @@ event but could not verify whether the underlying purchase is real or test.
 Indexes:
 
 - unique `(data_source_id, source_event_id)` where source ids are stable.
-- `(workspace_id, occurred_at)`.
-- `(workspace_id, source_type, source_event_type)`.
-- `(workspace_id, environment, occurred_at)`.
+- `(app_id, occurred_at)`.
+- `(app_id, source_type, source_event_type)`.
+- `(app_id, environment, occurred_at)`.
 - `(payload_sha256)` for dedupe support.
 
 ### normalized_events
@@ -316,6 +342,7 @@ Important fields:
 
 - `id`
 - `workspace_id`
+- `app_id`
 - `app_user_id`
 - `apple_app_account_token`
 - `google_obfuscated_account_id`

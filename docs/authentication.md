@@ -1,140 +1,128 @@
-# Authentication Design
+# Authentication and App Access
 
-## Short Answer
+Revtern is multi-user by default. Every local or OIDC account receives a
+personal workspace for apps it owns, and can also access apps shared by other
+users. Local authentication always uses this multi-user model.
 
-Revtern should have a minimal user system from the beginning, but not a complex
-enterprise account system.
-
-For a self-hosted product that stores revenue, purchase events, and store API
-credentials, running with no login is risky. However, full organizations,
-invitations, SSO, audit logs, and granular RBAC can wait.
-
-## Recommended MVP Auth Model
-
-Support three modes:
+## Authentication Modes
 
 ```text
-REVTERN_AUTH_MODE=single_user
+REVTERN_AUTH_MODE=local
 REVTERN_AUTH_MODE=reverse_proxy
 REVTERN_AUTH_MODE=disabled
 ```
 
-### single_user
+### `local`
 
-Default production mode.
+This is the default production mode. It supports:
 
-Behavior:
-
-- On first launch, Revtern requires owner setup.
-- First user becomes `owner`.
-- Email and password login.
-- Session cookie.
-- CSRF protection for browser requests.
+- Local email/password accounts with Argon2id password hashes.
+- Open, invite-only, or closed registration.
+- OpenID Connect login and explicit identity linking.
+- Server-side browser sessions with CSRF protection.
 - Opaque, revocable bearer sessions for the mobile companion app.
-- All data belongs to one workspace.
+- Per-user app ownership, invitations, roles, and audit events.
 
-This is enough for most self-hosted indie developers.
+The first-run owner screen only bootstraps the first administrator; subsequent
+accounts use the same local account and invitation model.
 
-### reverse_proxy
+### `reverse_proxy`
 
-For users who deploy behind Authelia, Tailscale, Cloudflare Access, OAuth2
-Proxy, or similar.
+Revtern trusts `X-Forwarded-Email` (or `X-Forwarded-User`) only when the
+deployment is protected by a trusted authentication proxy. Each discovered
+user receives a personal workspace instead of being made an administrator of a
+shared global workspace.
 
-Behavior:
+Do not expose the API directly when this mode is enabled. The proxy must strip
+client-supplied identity headers before adding its trusted values.
 
-- Revtern trusts configured headers from a trusted reverse proxy.
-- Example headers: `X-Forwarded-User`, `X-Forwarded-Email`.
-- Local password login can be disabled.
-- Still creates an internal user row for ownership and audit references.
+### `disabled`
 
-This mode is useful for advanced self-hosters.
+Development only. Outside development it requires
+`REVTERN_UNSAFE_DISABLE_AUTH=1`. It must not be used for an internet-accessible
+deployment.
 
-### disabled
+## Registration
 
-Development-only mode.
+`REVTERN_REGISTRATION_MODE` controls account creation in `local` mode:
 
-Behavior:
+- `invite_only` (default): a valid app invitation is required.
+- `open`: anyone who can reach the server can register.
+- `closed`: no new local or OIDC accounts can be created.
 
-- No login.
-- Server should warn loudly at startup.
-- Should be refused unless `REVTERN_ENV=development` or an explicit unsafe flag
-  is set.
+Invitations are email-bound, expire after seven days, and are stored as token
+hashes. A newly generated invitation URL is shown once to an app manager.
 
-## Why Not Skip Users Entirely?
+## App Roles
 
-Even for self-host:
+Access is evaluated for every app and every API query. Workspace IDs are not an
+authorization boundary by themselves.
 
-- Store credentials need access control.
-- Raw purchase data can contain sensitive information.
-- A browser dashboard exposed accidentally should not leak revenue data.
-- Future hosted cloud needs a migration path.
-- User ownership is useful for setup, secrets, and audit trails.
+| Role | Read dashboard and ledger | Raw events and export | Edit app, catalog, sources, jobs | Credentials and members |
+| --- | --- | --- | --- | --- |
+| Viewer | Yes | No | No | No |
+| Analyst | Yes | Yes | No | No |
+| Editor | Yes | Yes | Yes | No |
+| Manager | Yes | Yes | Yes | Yes |
+| Owner / workspace admin | Yes | Yes | Yes | Yes |
 
-The important part is keeping the first version small.
+The underlying capabilities are:
 
-## MVP Tables
+```text
+app.read
+ledger.read
+events.sensitive.read
+export.run
+app.write
+catalog.write
+source.write
+source.credentials.write
+jobs.run
+members.manage
+```
 
-### users
+App rows identify an `owner_user_id`. Shared access is represented by an
+`app_memberships` row linked to an `app_roles` role. Invitations do not grant
+access until they are accepted by the matching email account.
 
-- `id`
-- `email`
-- `password_hash`
-- `display_name`
-- `role`
-- `created_at`
-- `last_login_at`
+## OpenID Connect
 
-### sessions
+Configure one provider with:
 
-- `id`
-- `user_id`
-- `session_hash`
-- `expires_at`
-- `created_at`
-- `last_seen_at`
+```text
+REVTERN_OIDC_NAME=Company SSO
+REVTERN_OIDC_ISSUER=https://id.example.com/realms/revtern
+REVTERN_OIDC_CLIENT_ID=revtern
+REVTERN_OIDC_CLIENT_SECRET=replace-me
+REVTERN_OIDC_SCOPES=openid profile email
+```
 
-### workspaces
+Register this redirect URI at the provider:
 
-- `id`
-- `name`
-- `created_at`
+```text
+https://revtern.example.com/api/auth/oidc/callback
+```
 
-MVP can enforce one workspace globally.
+Revtern uses Authorization Code flow with PKCE, one-time hashed state, nonce,
+OIDC discovery, JWKS signature verification, issuer/audience/authorized-party
+checks, and an exact configured redirect URI. Production discovery and token
+endpoints must use HTTPS.
 
-## Roles
+OIDC subjects are the stable account key. Revtern never automatically links an
+OIDC identity to an existing local account by matching email alone. Sign in to
+the local account and use Settings → Sign-in methods to link it explicitly.
+Creating an OIDC-only account requires a verified email claim.
 
-MVP roles:
+## Sessions and Secrets
 
-- `owner`: can configure sources, view raw events, manage settings.
-- `viewer`: can view dashboards and non-secret data.
+- Browser sessions have a 12-hour idle timeout and 30-day absolute lifetime.
+- Session and mobile bearer tokens are stored as SHA-256 hashes.
+- Browser mutations require a matching CSRF cookie and header.
+- Source credentials are encrypted with `REVTERN_SECRET_KEY`; webhook shared
+  secrets are stored as password-style hashes.
+- Changes to app membership, invitations, authentication links, exports, and
+  app settings create audit rows.
 
-Viewer can be added after the first owner-only version. The schema can support
-it early without exposing the UI.
-
-## Passwords and Sessions
-
-Use:
-
-- Argon2id for password hashing.
-- Secure, HTTP-only, SameSite cookies.
-- Server-side sessions stored in Postgres.
-- CSRF token for state-changing browser requests.
-- Keychain/Keystore-backed bearer tokens on mobile, stored as hashes on the
-  server and revocable through `DELETE /api/mobile/session`.
-
-Avoid JWT-only browser auth for MVP. Server-side sessions are easier to revoke
-and inspect in a self-hosted admin tool.
-
-## Future Auth
-
-Later additions:
-
-- Invite users.
-- Multiple workspaces.
-- OAuth login.
-- SSO.
-- API tokens.
-- Audit log.
-- Granular RBAC.
-
-Do not build these before the data pipeline and dashboard are useful.
+Use a unique `REVTERN_SECRET_KEY` of at least 32 characters and HTTPS in
+production. Changing the key makes encrypted source credentials and outstanding
+OIDC login transactions unreadable.

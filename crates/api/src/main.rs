@@ -1,8 +1,10 @@
+mod access;
 mod auth;
 mod catchup;
 mod config;
 mod crypto;
 mod error;
+mod oidc;
 mod purchase_lookup;
 mod routes;
 mod webhook_verification;
@@ -12,7 +14,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     http::{
-        HeaderName, Method,
+        HeaderName, HeaderValue, Method,
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
     routing::get,
@@ -60,6 +62,10 @@ async fn main() -> anyhow::Result<()> {
         pool,
         config: config.clone(),
     };
+    let browser_origin = reqwest::Url::parse(&config.base_url)?
+        .origin()
+        .ascii_serialization();
+    let browser_origin = HeaderValue::from_str(&browser_origin)?;
 
     let worker_pool = state.pool.clone();
     tokio::spawn(async move {
@@ -79,9 +85,10 @@ async fn main() -> anyhow::Result<()> {
     let mut app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(routes::router(state.clone()))
+        .merge(oidc::router(state.clone()))
         .layer(
             CorsLayer::new()
-                .allow_origin(AllowOrigin::mirror_request())
+                .allow_origin(AllowOrigin::exact(browser_origin))
                 .allow_headers([
                     CONTENT_TYPE,
                     AUTHORIZATION,

@@ -17,15 +17,16 @@ import {
   last30Days,
   trustLabel,
 } from '@/lib/format';
-import { useApi } from '@/providers/auth';
+import { useApi, useAuth } from '@/providers/auth';
 
 const period = last30Days();
 
 export default function HomeScreen() {
   const api = useApi();
+  const { selectedApp, selectedAppId } = useAuth();
   const router = useRouter();
   const theme = useTheme();
-  const filters = { ...period };
+  const filters = { ...period, app_id: selectedAppId ?? undefined };
   const overview = useQuery({ queryKey: ['overview', filters], queryFn: () => api.overview(filters) });
   const series = useQuery({
     queryKey: ['revenue-series', filters],
@@ -45,7 +46,7 @@ export default function HomeScreen() {
     <Screen
       onRefresh={refresh}
       refreshing={refreshing}
-      subtitle="Last 30 days"
+      subtitle={selectedApp ? `${selectedApp.name} · Last 30 days` : 'Last 30 days'}
       title="Overview">
       {overview.isLoading ? <LoadingState label="Loading overview" /> : null}
       {overview.error ? <ErrorState error={overview.error} /> : null}

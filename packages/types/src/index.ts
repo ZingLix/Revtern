@@ -32,7 +32,30 @@ export interface OverviewResponse {
 
 export interface SetupStatus {
   needs_setup: boolean;
-  auth_mode: "single_user" | "reverse_proxy" | "disabled";
+  auth_mode: "local" | "reverse_proxy" | "disabled";
+  registration_mode: "closed" | "invite_only" | "open";
+  oidc?: { name: string } | null;
+}
+
+export interface AuthProvidersResponse {
+  local: { enabled: boolean };
+  oidc?: { enabled: boolean; name: string } | null;
+  registration_mode: "closed" | "invite_only" | "open";
+}
+
+export interface AuthIdentityRecord {
+  id: Id;
+  provider_id: string;
+  provider_name: string;
+  email?: string | null;
+  email_verified: boolean;
+  last_authenticated_at?: string | null;
+  created_at: string;
+}
+
+export interface AuthIdentitiesResponse {
+  has_local_password: boolean;
+  identities: AuthIdentityRecord[];
 }
 
 export interface UserSummary {
@@ -53,13 +76,58 @@ export interface MeResponse {
 
 export interface AppRecord {
   id: Id;
+  workspace_id: Id;
+  owner_user_id: Id;
   name: string;
   platform_bundle_id?: string | null;
   apple_bundle_id?: string | null;
   google_package_name?: string | null;
   default_currency?: string | null;
+  role: "owner" | "workspace_admin" | "viewer" | "analyst" | "editor" | "manager" | string;
+  permissions: string[];
   created_at: string;
   updated_at: string;
+}
+
+export interface AppRoleRecord {
+  key: "viewer" | "analyst" | "editor" | "manager" | string;
+  name: string;
+  description: string;
+  permissions: string[];
+}
+
+export interface AppMemberRecord {
+  user_id: Id;
+  email: string;
+  display_name?: string | null;
+  role: string;
+  access_origin: "owner" | "workspace" | "membership" | string;
+}
+
+export interface AppInvitationRecord {
+  id: Id;
+  email: string;
+  role: string;
+  expires_at: string;
+  created_at?: string;
+  invite_token?: string;
+  invite_url?: string;
+}
+
+export interface AppMembersResponse {
+  members: AppMemberRecord[];
+  invitations: AppInvitationRecord[];
+  roles: AppRoleRecord[];
+}
+
+export interface InvitationPreview {
+  id: Id;
+  email: string;
+  expires_at: string;
+  app_id: Id;
+  app_name: string;
+  role: string;
+  inviter_name?: string | null;
 }
 
 export interface DataSourceRecord {
@@ -135,6 +203,7 @@ export interface LogicalProductRecord {
 export interface RawEventRecord {
   id: Id;
   workspace_id: Id;
+  app_id: Id;
   data_source_id: Id;
   data_source_name?: string | null;
   source_type: SourceType;
@@ -259,6 +328,7 @@ export interface SubscriptionDetailResponse {
 export interface SyncRunRecord {
   id: Id;
   workspace_id: Id;
+  app_id?: Id | null;
   data_source_id?: Id | null;
   data_source_name?: string | null;
   sync_type: string;
@@ -273,6 +343,8 @@ export interface SyncRunRecord {
 
 export interface JobRecord {
   id: Id;
+  workspace_id?: Id | null;
+  app_id?: Id | null;
   queue: string;
   job_type: string;
   payload: unknown;

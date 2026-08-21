@@ -29,7 +29,8 @@ services:
       REVTERN_BASE_URL: http://localhost:3000
       REVTERN_BIND: 0.0.0.0:3000
       REVTERN_ENV: development
-      REVTERN_AUTH_MODE: single_user
+      REVTERN_AUTH_MODE: local
+      REVTERN_REGISTRATION_MODE: invite_only
       REVTERN_SECRET_KEY: change-this-to-a-long-random-secret-before-production
       REVTERN_WEB_DIST: /app/web
     ports:

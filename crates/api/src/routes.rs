@@ -9,20 +9,22 @@ use axum::{
 };
 use axum_extra::extract::CookieJar;
 use revtern_connectors::extract_event;
-use revtern_core::{new_id, payload_sha256};
+use revtern_core::{new_id, payload_sha256, sha256_hex};
 use revtern_jobs::{enqueue_normalization, process_normalization_job, process_raw_event};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{Postgres, QueryBuilder, Row};
 use time::{
-    Date, OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description,
+    Date, Duration, OffsetDateTime, format_description::well_known::Rfc3339,
+    macros::format_description,
 };
 
 use crate::{
     AppState,
+    access::{self, Capability},
     auth::{self, CsrfGuard, CurrentUser},
     catchup::{CatchUpWindow, acknowledge_batch, fetch_webhook_notifications},
-    config::AuthMode,
+    config::{AuthMode, RegistrationMode},
     crypto,
     error::{ApiError, ApiResult},
     purchase_lookup, webhook_verification,
@@ -35,6 +37,11 @@ pub fn router(state: AppState) -> Router {
             Router::new()
                 .route("/setup/status", get(setup_status))
                 .route("/setup/owner", post(setup_owner))
+                .route("/registration", post(register_user))
+                .route(
+                    "/invitations/{token}",
+                    get(get_invitation).post(accept_invitation),
+                )
                 .route("/session", post(create_session).delete(delete_session))
                 .route(
                     "/mobile/session",
@@ -43,6 +50,16 @@ pub fn router(state: AppState) -> Router {
                 .route("/me", get(me))
                 .route("/apps", get(list_apps).post(create_app))
                 .route("/apps/{app_id}", patch(update_app))
+                .route("/apps/{app_id}/members", get(list_app_members))
+                .route("/apps/{app_id}/invitations", post(create_app_invitation))
+                .route(
+                    "/apps/{app_id}/invitations/{invitation_id}",
+                    axum::routing::delete(revoke_app_invitation),
+                )
+                .route(
+                    "/apps/{app_id}/members/{member_user_id}",
+                    patch(update_app_member).delete(remove_app_member),
+                )
                 .route(
                     "/data-sources",
                     get(list_data_sources).post(create_data_source),
@@ -109,8 +126,10 @@ async fn setup_status(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         .fetch_one(&state.pool)
         .await?;
     Ok(Json(json!({
-        "needs_setup": count == 0 && state.config.auth_mode == AuthMode::SingleUser,
+        "needs_setup": count == 0 && state.config.auth_mode == AuthMode::Local,
         "auth_mode": auth_mode_name(&state.config.auth_mode),
+        "registration_mode": registration_mode_name(&state.config.registration_mode),
+        "oidc": state.config.oidc.as_ref().map(|provider| json!({ "name": provider.name })),
     })))
 }
 
@@ -119,8 +138,15 @@ async fn setup_owner(
     jar: CookieJar,
     Json(input): Json<SetupOwnerRequest>,
 ) -> ApiResult<(CookieJar, Json<Value>)> {
+    if state.config.auth_mode != AuthMode::Local {
+        return Err(ApiError::invalid("owner setup requires local auth mode"));
+    }
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock(hashtext('revtern_setup_owner'))")
+        .execute(&mut *tx)
+        .await?;
     let existing: i64 = sqlx::query_scalar("select count(*) from users")
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await?;
     if existing > 0 {
         return Err(ApiError::Conflict(
@@ -143,26 +169,281 @@ async fn setup_owner(
     sqlx::query("insert into workspaces (id, name, created_at) values ($1, $2, now())")
         .bind(&workspace_id)
         .bind(input.workspace_name.trim())
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "insert into users (id, email, password_hash, display_name, role, created_at, last_login_at) values ($1, $2, $3, $4, 'owner', now(), now())",
+        "insert into users (id, email, password_hash, display_name, role, status, created_at, updated_at, last_login_at) values ($1, $2, $3, $4, 'owner', 'active', now(), now(), now())",
     )
     .bind(&user_id)
     .bind(input.email.trim().to_ascii_lowercase())
     .bind(password_hash)
     .bind(input.email.trim())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "insert into workspace_users (workspace_id, user_id, role) values ($1, $2, 'owner')",
+        "insert into workspace_users (workspace_id, user_id, role, status, created_at, updated_at) values ($1, $2, 'owner', 'active', now(), now())",
     )
     .bind(&workspace_id)
     .bind(&user_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     let jar = auth::create_session(&state.pool, &state.config, &user_id, jar).await?;
     Ok((jar, Json(json!({ "created": true }))))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistrationRequest {
+    email: String,
+    password: String,
+    display_name: Option<String>,
+    invite_token: Option<String>,
+}
+
+async fn register_user(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(input): Json<RegistrationRequest>,
+) -> ApiResult<(CookieJar, Json<Value>)> {
+    if state.config.auth_mode != AuthMode::Local {
+        return Err(ApiError::invalid("registration requires local auth mode"));
+    }
+    let email = input.email.trim().to_ascii_lowercase();
+    if !email.contains('@') {
+        return Err(ApiError::invalid("email must be valid"));
+    }
+    if input.password.len() < 8 {
+        return Err(ApiError::invalid("password must be at least 8 characters"));
+    }
+    if state.config.registration_mode == RegistrationMode::Closed {
+        return Err(ApiError::Forbidden("registration is closed".to_string()));
+    }
+    if state.config.registration_mode == RegistrationMode::InviteOnly
+        && input.invite_token.as_deref().unwrap_or_default().is_empty()
+    {
+        return Err(ApiError::Forbidden(
+            "a valid invitation is required".to_string(),
+        ));
+    }
+
+    let display_name = input
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&email)
+        .to_string();
+    let password_hash = auth::hash_password(&input.password)?;
+    let user_id = new_id("usr");
+    let workspace_id = new_id("wsp");
+    let mut tx = state.pool.begin().await?;
+
+    let existing: bool = sqlx::query_scalar("select exists(select 1 from users where email = $1)")
+        .bind(&email)
+        .fetch_one(&mut *tx)
+        .await?;
+    if existing {
+        return Err(ApiError::Conflict(
+            "an account with this email already exists".to_string(),
+        ));
+    }
+
+    sqlx::query(
+        "insert into users (id, email, password_hash, display_name, role, status, created_at, updated_at) values ($1, $2, $3, $4, 'owner', 'active', now(), now())",
+    )
+    .bind(&user_id)
+    .bind(&email)
+    .bind(password_hash)
+    .bind(&display_name)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("insert into workspaces (id, name, created_at) values ($1, $2, now())")
+        .bind(&workspace_id)
+        .bind(format!("{display_name}'s Apps"))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "insert into workspace_users (workspace_id, user_id, role, status, created_at, updated_at) values ($1, $2, 'owner', 'active', now(), now())",
+    )
+    .bind(&workspace_id)
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let accepted_app_id = if let Some(token) = input
+        .invite_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        Some(
+            accept_invitation_in_transaction(
+                &mut tx,
+                &sha256_hex(token.as_bytes()),
+                &user_id,
+                &email,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    sqlx::query(
+        "insert into audit_events (id, workspace_id, app_id, actor_user_id, action, target_type, target_id, metadata, created_at) values ($1, $2, $3, $4, 'user.registered', 'user', $4, $5, now())",
+    )
+    .bind(new_id("aud"))
+    .bind(&workspace_id)
+    .bind(accepted_app_id.as_deref())
+    .bind(&user_id)
+    .bind(json!({ "auth_method": "local" }))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let jar = auth::create_session(&state.pool, &state.config, &user_id, jar).await?;
+    Ok((
+        jar,
+        Json(json!({
+            "created": true,
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "accepted_app_id": accepted_app_id
+        })),
+    ))
+}
+
+async fn get_invitation(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let row = sqlx::query(
+        r#"
+        select ai.id, ai.email, ai.expires_at, a.id as app_id, a.name as app_name,
+               ar.role_key, u.display_name as inviter_name
+        from app_invitations ai
+        join apps a on a.id = ai.app_id and a.deleted_at is null
+        join app_roles ar on ar.id = ai.role_id
+        left join users u on u.id = ai.invited_by_user_id
+        where ai.token_hash = $1
+          and ai.accepted_at is null
+          and ai.revoked_at is null
+          and ai.expires_at > now()
+        "#,
+    )
+    .bind(sha256_hex(token.as_bytes()))
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("invitation not found or expired".to_string()))?;
+    Ok(Json(json!({
+        "invitation": {
+            "id": row.try_get::<String, _>("id")?,
+            "email": row.try_get::<String, _>("email")?,
+            "expires_at": dt(row.try_get::<OffsetDateTime, _>("expires_at")?),
+            "app_id": row.try_get::<String, _>("app_id")?,
+            "app_name": row.try_get::<String, _>("app_name")?,
+            "role": row.try_get::<String, _>("role_key")?,
+            "inviter_name": row.try_get::<Option<String>, _>("inviter_name")?,
+        }
+    })))
+}
+
+async fn accept_invitation(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    _csrf: CsrfGuard,
+    Path(token): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let mut tx = state.pool.begin().await?;
+    let app_id = accept_invitation_in_transaction(
+        &mut tx,
+        &sha256_hex(token.as_bytes()),
+        &user.user.id,
+        &user.user.email,
+    )
+    .await?;
+    tx.commit().await?;
+    let access = access::app_access(&state.pool, &user.user.id, &app_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("app not found".to_string()))?;
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&access.workspace_id),
+        Some(&app_id),
+        "app.invitation.accepted",
+        Some("app"),
+        Some(&app_id),
+        json!({}),
+    )
+    .await?;
+    Ok(Json(json!({ "accepted": true, "app_id": app_id })))
+}
+
+pub(crate) async fn accept_invitation_in_transaction(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    token_hash: &str,
+    user_id: &str,
+    email: &str,
+) -> ApiResult<String> {
+    let row = sqlx::query(
+        r#"
+        select ai.id, ai.app_id, ai.normalized_email, ai.role_id, a.workspace_id
+        from app_invitations ai
+        join apps a on a.id = ai.app_id and a.deleted_at is null
+        where ai.token_hash = $1
+          and ai.accepted_at is null
+          and ai.revoked_at is null
+          and ai.expires_at > now()
+        for update of ai
+        "#,
+    )
+    .bind(token_hash)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("invitation not found or expired".to_string()))?;
+    let normalized_email: String = row.try_get("normalized_email")?;
+    if normalized_email != email.trim().to_ascii_lowercase() {
+        return Err(ApiError::Forbidden(
+            "this invitation was issued to a different email address".to_string(),
+        ));
+    }
+    let invitation_id: String = row.try_get("id")?;
+    let app_id: String = row.try_get("app_id")?;
+    let workspace_id: String = row.try_get("workspace_id")?;
+    let role_id: String = row.try_get("role_id")?;
+    sqlx::query(
+        r#"
+        insert into workspace_users (workspace_id, user_id, role, status, created_at, updated_at)
+        values ($1, $2, 'guest', 'active', now(), now())
+        on conflict (workspace_id, user_id) do nothing
+        "#,
+    )
+    .bind(&workspace_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        insert into app_memberships (app_id, user_id, role_id, created_at, updated_at)
+        values ($1, $2, $3, now(), now())
+        on conflict (app_id, user_id) do update
+          set role_id = excluded.role_id, updated_at = now()
+        "#,
+    )
+    .bind(&app_id)
+    .bind(user_id)
+    .bind(role_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "update app_invitations set accepted_at = now(), accepted_by_user_id = $2 where id = $1",
+    )
+    .bind(invitation_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(app_id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,14 +457,21 @@ async fn create_session(
     jar: CookieJar,
     Json(input): Json<LoginRequest>,
 ) -> ApiResult<(CookieJar, Json<Value>)> {
-    let row = sqlx::query("select id, password_hash from users where email = $1")
-        .bind(input.email.trim().to_ascii_lowercase())
-        .fetch_optional(&state.pool)
-        .await?;
+    if state.config.auth_mode != AuthMode::Local {
+        return Err(ApiError::invalid("password login requires local auth mode"));
+    }
+    let row =
+        sqlx::query("select id, password_hash from users where email = $1 and status = 'active'")
+            .bind(input.email.trim().to_ascii_lowercase())
+            .fetch_optional(&state.pool)
+            .await?;
     let row = row.ok_or_else(|| ApiError::Unauthorized("invalid email or password".to_string()))?;
     let user_id: String = row.try_get("id")?;
-    let password_hash: String = row.try_get("password_hash")?;
-    if !auth::verify_password(&input.password, &password_hash) {
+    let password_hash: Option<String> = row.try_get("password_hash")?;
+    if !password_hash
+        .as_deref()
+        .is_some_and(|hash| auth::verify_password(&input.password, hash))
+    {
         return Err(ApiError::Unauthorized(
             "invalid email or password".to_string(),
         ));
@@ -200,19 +488,23 @@ async fn create_mobile_session(
     State(state): State<AppState>,
     Json(input): Json<LoginRequest>,
 ) -> ApiResult<Json<Value>> {
-    if state.config.auth_mode != AuthMode::SingleUser {
+    if state.config.auth_mode != AuthMode::Local {
         return Err(ApiError::invalid(
-            "mobile password login requires single_user auth mode",
+            "mobile password login requires local auth mode",
         ));
     }
-    let row = sqlx::query("select id, password_hash from users where email = $1")
-        .bind(input.email.trim().to_ascii_lowercase())
-        .fetch_optional(&state.pool)
-        .await?;
+    let row =
+        sqlx::query("select id, password_hash from users where email = $1 and status = 'active'")
+            .bind(input.email.trim().to_ascii_lowercase())
+            .fetch_optional(&state.pool)
+            .await?;
     let row = row.ok_or_else(|| ApiError::Unauthorized("invalid email or password".to_string()))?;
     let user_id: String = row.try_get("id")?;
-    let password_hash: String = row.try_get("password_hash")?;
-    if !auth::verify_password(&input.password, &password_hash) {
+    let password_hash: Option<String> = row.try_get("password_hash")?;
+    if !password_hash
+        .as_deref()
+        .is_some_and(|hash| auth::verify_password(&input.password, hash))
+    {
         return Err(ApiError::Unauthorized(
             "invalid email or password".to_string(),
         ));
@@ -270,17 +562,31 @@ struct AppRequest {
 async fn list_apps(State(state): State<AppState>, user: CurrentUser) -> ApiResult<Json<Value>> {
     let rows = sqlx::query(
         r#"
-        select id, name, platform_bundle_id, apple_bundle_id, google_package_name, default_currency, created_at, updated_at
-        from apps
-        where workspace_id = $1
-        order by created_at asc
+        select a.id, a.workspace_id, a.owner_user_id, a.name, a.platform_bundle_id,
+               a.apple_bundle_id, a.google_package_name, a.default_currency,
+               a.created_at, a.updated_at,
+               case
+                 when a.owner_user_id = $1 then 'owner'
+                 when wu.role in ('owner', 'admin') then 'workspace_admin'
+                 else coalesce(ar.role_key, 'viewer')
+               end as access_role,
+               array_agg(distinct eap.permission order by eap.permission) as permissions
+        from apps a
+        join effective_app_permissions eap on eap.app_id = a.id and eap.user_id = $1
+        left join workspace_users wu
+          on wu.workspace_id = a.workspace_id and wu.user_id = $1 and wu.status = 'active'
+        left join app_memberships am on am.app_id = a.id and am.user_id = $1
+        left join app_roles ar on ar.id = am.role_id
+        where a.deleted_at is null
+        group by a.id, wu.role, ar.role_key
+        order by a.created_at asc
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&user.user.id)
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(
-        json!({ "apps": rows.into_iter().map(app_json).collect::<ApiResult<Vec<_>>>()? }),
+        json!({ "apps": rows.into_iter().map(app_with_access_json).collect::<ApiResult<Vec<_>>>()? }),
     ))
 }
 
@@ -290,18 +596,27 @@ async fn create_app(
     _csrf: CsrfGuard,
     Json(input): Json<AppRequest>,
 ) -> ApiResult<Json<Value>> {
+    if matches!(user.user.role.as_str(), "viewer" | "guest") {
+        return Err(ApiError::Forbidden(
+            "workspace members with app creation access are required".to_string(),
+        ));
+    }
     if input.name.trim().is_empty() {
         return Err(ApiError::invalid("name is required"));
     }
     let id = new_id("app");
     sqlx::query(
         r#"
-        insert into apps (id, workspace_id, name, platform_bundle_id, apple_bundle_id, google_package_name, default_currency, created_at, updated_at)
-        values ($1, $2, $3, $4, $5, $6, $7, now(), now())
+        insert into apps (
+          id, workspace_id, owner_user_id, created_by_user_id, name,
+          platform_bundle_id, apple_bundle_id, google_package_name, default_currency,
+          created_at, updated_at
+        ) values ($1, $2, $3, $3, $4, $5, $6, $7, $8, now(), now())
         "#,
     )
     .bind(&id)
     .bind(&user.workspace.id)
+    .bind(&user.user.id)
     .bind(input.name.trim())
     .bind(input.platform_bundle_id.as_deref())
     .bind(input.apple_bundle_id.as_deref())
@@ -309,8 +624,19 @@ async fn create_app(
     .bind(input.default_currency.as_deref())
     .execute(&state.pool)
     .await?;
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&user.workspace.id),
+        Some(&id),
+        "app.created",
+        Some("app"),
+        Some(&id),
+        json!({ "name": input.name.trim() }),
+    )
+    .await?;
     Ok(Json(
-        json!({ "app": get_app_json(&state, &user.workspace.id, &id).await? }),
+        json!({ "app": get_app_for_user_json(&state, &user.user.id, &id).await? }),
     ))
 }
 
@@ -321,19 +647,22 @@ async fn update_app(
     Path(app_id): Path<String>,
     Json(input): Json<AppRequest>,
 ) -> ApiResult<Json<Value>> {
+    let app_access = access::require_app(&state.pool, &user, &app_id, Capability::AppWrite).await?;
+    if input.name.trim().is_empty() {
+        return Err(ApiError::invalid("name is required"));
+    }
     sqlx::query(
         r#"
         update apps
-        set name = $3,
-            platform_bundle_id = $4,
-            apple_bundle_id = $5,
-            google_package_name = $6,
-            default_currency = $7,
+        set name = $2,
+            platform_bundle_id = $3,
+            apple_bundle_id = $4,
+            google_package_name = $5,
+            default_currency = $6,
             updated_at = now()
-        where workspace_id = $1 and id = $2
+        where id = $1
         "#,
     )
-    .bind(&user.workspace.id)
     .bind(&app_id)
     .bind(input.name.trim())
     .bind(input.platform_bundle_id.as_deref())
@@ -342,9 +671,368 @@ async fn update_app(
     .bind(input.default_currency.as_deref())
     .execute(&state.pool)
     .await?;
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&app_access.workspace_id),
+        Some(&app_id),
+        "app.updated",
+        Some("app"),
+        Some(&app_id),
+        json!({ "name": input.name.trim() }),
+    )
+    .await?;
     Ok(Json(
-        json!({ "app": get_app_json(&state, &user.workspace.id, &app_id).await? }),
+        json!({ "app": get_app_for_user_json(&state, &user.user.id, &app_id).await? }),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct AppInvitationRequest {
+    email: String,
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppMemberRoleRequest {
+    role: String,
+}
+
+async fn list_app_members(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(app_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    access::require_app(&state.pool, &user, &app_id, Capability::MembersManage).await?;
+    let rows = sqlx::query(
+        r#"
+        with app_context as (
+          select id, workspace_id, owner_user_id from apps where id = $1 and deleted_at is null
+        ), candidates as (
+          select a.owner_user_id as user_id, 'owner'::text as access_role, 'owner'::text as access_origin, 0 as priority
+          from app_context a
+          union all
+          select wu.user_id, 'workspace_admin', 'workspace', 1
+          from app_context a
+          join workspace_users wu on wu.workspace_id = a.workspace_id
+          where wu.status = 'active' and wu.role in ('owner', 'admin') and wu.user_id <> a.owner_user_id
+          union all
+          select am.user_id, ar.role_key, 'membership', 2
+          from app_memberships am
+          join app_roles ar on ar.id = am.role_id
+          where am.app_id = $1
+        )
+        select distinct on (c.user_id)
+               c.user_id, u.email, u.display_name, c.access_role, c.access_origin, c.priority
+        from candidates c
+        join users u on u.id = c.user_id and u.status = 'active'
+        order by c.user_id, c.priority asc
+        "#,
+    )
+    .bind(&app_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let invitations = sqlx::query(
+        r#"
+        select ai.id, ai.email, ar.role_key, ai.expires_at, ai.created_at
+        from app_invitations ai
+        join app_roles ar on ar.id = ai.role_id
+        where ai.app_id = $1
+          and ai.accepted_at is null
+          and ai.revoked_at is null
+          and ai.expires_at > now()
+        order by ai.created_at desc
+        "#,
+    )
+    .bind(&app_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let roles = sqlx::query(
+        r#"
+        select ar.role_key, ar.name, ar.description,
+               array_agg(arp.permission order by arp.permission) as permissions
+        from app_roles ar
+        join app_role_permissions arp on arp.role_id = ar.id
+        join apps a on a.id = $1
+        where ar.workspace_id is null or ar.workspace_id = a.workspace_id
+        group by ar.id
+        order by case ar.role_key
+          when 'viewer' then 0 when 'analyst' then 1 when 'editor' then 2 when 'manager' then 3 else 4 end
+        "#,
+    )
+    .bind(&app_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(json!({
+        "members": rows.into_iter().map(|row| -> ApiResult<Value> {
+            Ok(json!({
+                "user_id": row.try_get::<String, _>("user_id")?,
+                "email": row.try_get::<String, _>("email")?,
+                "display_name": row.try_get::<Option<String>, _>("display_name")?,
+                "role": row.try_get::<String, _>("access_role")?,
+                "access_origin": row.try_get::<String, _>("access_origin")?,
+            }))
+        }).collect::<ApiResult<Vec<_>>>()?,
+        "invitations": invitations.into_iter().map(|row| -> ApiResult<Value> {
+            Ok(json!({
+                "id": row.try_get::<String, _>("id")?,
+                "email": row.try_get::<String, _>("email")?,
+                "role": row.try_get::<String, _>("role_key")?,
+                "expires_at": dt(row.try_get::<OffsetDateTime, _>("expires_at")?),
+                "created_at": dt(row.try_get::<OffsetDateTime, _>("created_at")?),
+            }))
+        }).collect::<ApiResult<Vec<_>>>()?,
+        "roles": roles.into_iter().map(|row| -> ApiResult<Value> {
+            Ok(json!({
+                "key": row.try_get::<String, _>("role_key")?,
+                "name": row.try_get::<String, _>("name")?,
+                "description": row.try_get::<String, _>("description")?,
+                "permissions": row.try_get::<Vec<String>, _>("permissions")?,
+            }))
+        }).collect::<ApiResult<Vec<_>>>()?
+    })))
+}
+
+async fn create_app_invitation(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    _csrf: CsrfGuard,
+    Path(app_id): Path<String>,
+    Json(input): Json<AppInvitationRequest>,
+) -> ApiResult<Json<Value>> {
+    let app_access =
+        access::require_app(&state.pool, &user, &app_id, Capability::MembersManage).await?;
+    let email = input.email.trim().to_ascii_lowercase();
+    if !email.contains('@') {
+        return Err(ApiError::invalid("email must be valid"));
+    }
+    if email == user.user.email.to_ascii_lowercase() {
+        return Err(ApiError::invalid("you already have access to this app"));
+    }
+    let already_has_access: bool = sqlx::query_scalar(
+        r#"
+        select exists(
+          select 1
+          from users u
+          join effective_app_permissions eap on eap.user_id = u.id and eap.app_id = $2
+          where u.email = $1 and u.status = 'active' and eap.permission = 'app.read'
+        )
+        "#,
+    )
+    .bind(&email)
+    .bind(&app_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if already_has_access {
+        return Err(ApiError::Conflict(
+            "this user already has access to the app".to_string(),
+        ));
+    }
+    let role_id = app_role_id(&state.pool, &app_access.workspace_id, &input.role).await?;
+    let token = auth::random_token();
+    let invitation_id = new_id("inv");
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(7);
+    let invitation_row = sqlx::query(
+        r#"
+        insert into app_invitations (
+          id, app_id, email, normalized_email, role_id, token_hash,
+          invited_by_user_id, expires_at, created_at
+        ) values ($1, $2, $3, $3, $4, $5, $6, $7, now())
+        on conflict (app_id, normalized_email) where accepted_at is null and revoked_at is null
+        do update set role_id = excluded.role_id,
+                      token_hash = excluded.token_hash,
+                      invited_by_user_id = excluded.invited_by_user_id,
+                      expires_at = excluded.expires_at,
+                      created_at = now()
+        returning id
+        "#,
+    )
+    .bind(&invitation_id)
+    .bind(&app_id)
+    .bind(&email)
+    .bind(&role_id)
+    .bind(sha256_hex(token.as_bytes()))
+    .bind(&user.user.id)
+    .bind(expires_at)
+    .fetch_one(&state.pool)
+    .await?;
+    let invitation_id: String = invitation_row.try_get("id")?;
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&app_access.workspace_id),
+        Some(&app_id),
+        "app.invitation.created",
+        Some("invitation"),
+        Some(&invitation_id),
+        json!({ "email": email, "role": input.role }),
+    )
+    .await?;
+    Ok(Json(json!({
+        "invitation": {
+            "id": invitation_id,
+            "email": email,
+            "role": input.role,
+            "expires_at": dt(expires_at),
+            "invite_token": token,
+            "invite_url": format!("{}/invitations/{}", state.config.base_url.trim_end_matches('/'), token)
+        }
+    })))
+}
+
+async fn update_app_member(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    _csrf: CsrfGuard,
+    Path((app_id, member_user_id)): Path<(String, String)>,
+    Json(input): Json<AppMemberRoleRequest>,
+) -> ApiResult<Json<Value>> {
+    let app_access =
+        access::require_app(&state.pool, &user, &app_id, Capability::MembersManage).await?;
+    ensure_manageable_app_member(&state.pool, &app_id, &member_user_id).await?;
+    let role_id = app_role_id(&state.pool, &app_access.workspace_id, &input.role).await?;
+    let result = sqlx::query(
+        "update app_memberships set role_id = $3, granted_by_user_id = $4, updated_at = now() where app_id = $1 and user_id = $2",
+    )
+    .bind(&app_id)
+    .bind(&member_user_id)
+    .bind(role_id)
+    .bind(&user.user.id)
+    .execute(&state.pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("app member not found".to_string()));
+    }
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&app_access.workspace_id),
+        Some(&app_id),
+        "app.member.role_changed",
+        Some("user"),
+        Some(&member_user_id),
+        json!({ "role": input.role }),
+    )
+    .await?;
+    Ok(Json(json!({ "updated": true })))
+}
+
+async fn remove_app_member(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    _csrf: CsrfGuard,
+    Path((app_id, member_user_id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let app_access =
+        access::require_app(&state.pool, &user, &app_id, Capability::MembersManage).await?;
+    ensure_manageable_app_member(&state.pool, &app_id, &member_user_id).await?;
+    let result = sqlx::query("delete from app_memberships where app_id = $1 and user_id = $2")
+        .bind(&app_id)
+        .bind(&member_user_id)
+        .execute(&state.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("app member not found".to_string()));
+    }
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&app_access.workspace_id),
+        Some(&app_id),
+        "app.member.removed",
+        Some("user"),
+        Some(&member_user_id),
+        json!({}),
+    )
+    .await?;
+    Ok(Json(json!({ "removed": true })))
+}
+
+async fn revoke_app_invitation(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    _csrf: CsrfGuard,
+    Path((app_id, invitation_id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let app_access =
+        access::require_app(&state.pool, &user, &app_id, Capability::MembersManage).await?;
+    let result = sqlx::query(
+        "update app_invitations set revoked_at = now() where id = $1 and app_id = $2 and accepted_at is null and revoked_at is null",
+    )
+    .bind(&invitation_id)
+    .bind(&app_id)
+    .execute(&state.pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("invitation not found".to_string()));
+    }
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&app_access.workspace_id),
+        Some(&app_id),
+        "app.invitation.revoked",
+        Some("invitation"),
+        Some(&invitation_id),
+        json!({}),
+    )
+    .await?;
+    Ok(Json(json!({ "revoked": true })))
+}
+
+async fn app_role_id(pool: &sqlx::PgPool, workspace_id: &str, role: &str) -> ApiResult<String> {
+    let normalized = role.trim().to_ascii_lowercase();
+    if !matches!(
+        normalized.as_str(),
+        "viewer" | "analyst" | "editor" | "manager"
+    ) {
+        return Err(ApiError::invalid("unsupported app role"));
+    }
+    sqlx::query_scalar(
+        "select id from app_roles where role_key = $1 and (workspace_id is null or workspace_id = $2) order by workspace_id nulls first limit 1",
+    )
+    .bind(normalized)
+    .bind(workspace_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::invalid("app role is not configured"))
+}
+
+async fn ensure_manageable_app_member(
+    pool: &sqlx::PgPool,
+    app_id: &str,
+    member_user_id: &str,
+) -> ApiResult<()> {
+    let row = sqlx::query(
+        r#"
+        select a.owner_user_id,
+               exists(
+                 select 1 from workspace_users wu
+                 where wu.workspace_id = a.workspace_id
+                   and wu.user_id = $2
+                   and wu.status = 'active'
+                   and wu.role in ('owner', 'admin')
+               ) as workspace_admin
+        from apps a where a.id = $1 and a.deleted_at is null
+        "#,
+    )
+    .bind(app_id)
+    .bind(member_user_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("app not found".to_string()))?;
+    if row.try_get::<String, _>("owner_user_id")? == member_user_id {
+        return Err(ApiError::Conflict(
+            "app ownership must be transferred instead".to_string(),
+        ));
+    }
+    if row.try_get::<bool, _>("workspace_admin")? {
+        return Err(ApiError::Conflict(
+            "workspace administrator access cannot be changed from the app".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,17 +1059,20 @@ struct CatchUpRequest {
 async fn list_data_sources(
     State(state): State<AppState>,
     user: CurrentUser,
+    Query(filters): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
     let rows = sqlx::query(
         r#"
         select ds.*, a.name as app_name
         from data_sources ds
         left join apps a on a.id = ds.app_id
-        where ds.workspace_id = $1
+        where has_app_permission($1, ds.app_id, 'app.read')
+          and ($2::text is null or ds.app_id = $2)
         order by ds.created_at desc
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&user.user.id)
+    .bind(filters.get("app_id"))
     .fetch_all(&state.pool)
     .await?;
     let sources = rows
@@ -401,9 +1092,17 @@ async fn create_data_source(
     if input.name.trim().is_empty() {
         return Err(ApiError::invalid("name is required"));
     }
-    if let Some(app_id) = input.app_id.as_deref() {
-        ensure_app(&state, &user.workspace.id, app_id).await?;
-    }
+    let app_id = input
+        .app_id
+        .as_deref()
+        .ok_or_else(|| ApiError::invalid("app_id is required"))?;
+    let credentials_configured = input.credentials.is_some();
+    let required = if credentials_configured {
+        Capability::SourceCredentialsWrite
+    } else {
+        Capability::SourceWrite
+    };
+    let app_access = access::require_app(&state.pool, &user, app_id, required).await?;
     let (encrypted_credentials, webhook_secret_hash) =
         prepare_source_credentials(&state, input.credentials)?;
     let id = new_id("src");
@@ -416,16 +1115,27 @@ async fn create_data_source(
         "#,
     )
     .bind(&id)
-    .bind(&user.workspace.id)
-    .bind(input.app_id.as_deref())
+    .bind(&app_access.workspace_id)
+    .bind(app_id)
     .bind(&source_type)
     .bind(input.name.trim())
     .bind(encrypted_credentials)
     .bind(webhook_secret_hash)
     .execute(&state.pool)
     .await?;
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&app_access.workspace_id),
+        Some(app_id),
+        "source.created",
+        Some("data_source"),
+        Some(&id),
+        json!({ "source_type": source_type, "name": input.name.trim(), "credentials_configured": credentials_configured }),
+    )
+    .await?;
     Ok(Json(
-        json!({ "data_source": get_data_source_json(&state, &user.workspace.id, &id).await? }),
+        json!({ "data_source": get_data_source_json(&state, &app_access.workspace_id, &id).await? }),
     ))
 }
 
@@ -434,8 +1144,10 @@ async fn get_data_source(
     user: CurrentUser,
     Path(source_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
+    let (_, source_access) =
+        authorized_source_row(&state, &user, &source_id, Capability::AppRead).await?;
     Ok(Json(
-        json!({ "data_source": get_data_source_json(&state, &user.workspace.id, &source_id).await? }),
+        json!({ "data_source": get_data_source_json(&state, &source_access.workspace_id, &source_id).await? }),
     ))
 }
 
@@ -446,27 +1158,43 @@ async fn update_data_source_credentials(
     Path(source_id): Path<String>,
     Json(input): Json<DataSourceCredentialsRequest>,
 ) -> ApiResult<Json<Value>> {
-    source_row(&state, &user.workspace.id, &source_id).await?;
+    let (_, source_access) = authorized_source_row(
+        &state,
+        &user,
+        &source_id,
+        Capability::SourceCredentialsWrite,
+    )
+    .await?;
     let (encrypted_credentials, webhook_secret_hash) =
         prepare_source_credentials(&state, input.credentials)?;
     sqlx::query(
         r#"
         update data_sources
-        set encrypted_credentials = $3,
-            webhook_secret_hash = coalesce($4, webhook_secret_hash),
+        set encrypted_credentials = $2,
+            webhook_secret_hash = coalesce($3, webhook_secret_hash),
             last_error = null,
             updated_at = now()
-        where workspace_id = $1 and id = $2
+        where id = $1
         "#,
     )
-    .bind(&user.workspace.id)
     .bind(&source_id)
     .bind(encrypted_credentials)
     .bind(webhook_secret_hash)
     .execute(&state.pool)
     .await?;
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&source_access.workspace_id),
+        Some(&source_access.app_id),
+        "source.credentials_updated",
+        Some("data_source"),
+        Some(&source_id),
+        json!({}),
+    )
+    .await?;
     Ok(Json(
-        json!({ "data_source": get_data_source_json(&state, &user.workspace.id, &source_id).await? }),
+        json!({ "data_source": get_data_source_json(&state, &source_access.workspace_id, &source_id).await? }),
     ))
 }
 
@@ -476,7 +1204,8 @@ async fn test_data_source(
     _csrf: CsrfGuard,
     Path(source_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let source = source_row(&state, &user.workspace.id, &source_id).await?;
+    let (source, source_access) =
+        authorized_source_row(&state, &user, &source_id, Capability::SourceWrite).await?;
     let sync_id = new_id("syn");
     let status: String = source.try_get("status")?;
     let last_event_at: Option<OffsetDateTime> = source.try_get("last_event_at")?;
@@ -490,12 +1219,13 @@ async fn test_data_source(
     };
     sqlx::query(
         r#"
-        insert into sync_runs (id, workspace_id, data_source_id, sync_type, status, started_at, finished_at, error)
-        values ($1, $2, $3, 'health_check', $4, now(), now(), $5)
+        insert into sync_runs (id, workspace_id, app_id, data_source_id, sync_type, status, started_at, finished_at, error)
+        values ($1, $2, $3, $4, 'health_check', $5, now(), now(), $6)
         "#,
     )
     .bind(&sync_id)
-    .bind(&user.workspace.id)
+    .bind(&source_access.workspace_id)
+    .bind(&source_access.app_id)
     .bind(&source_id)
     .bind(outcome.0)
     .bind(outcome.1)
@@ -508,7 +1238,7 @@ async fn test_data_source(
     .execute(&state.pool)
     .await?;
     Ok(Json(
-        json!({ "sync_run": get_sync_run_json(&state, &user.workspace.id, &sync_id).await? }),
+        json!({ "sync_run": get_sync_run_json(&state, &source_access.workspace_id, &sync_id).await? }),
     ))
 }
 
@@ -519,20 +1249,33 @@ async fn catch_up_data_source(
     Path(source_id): Path<String>,
     Json(input): Json<CatchUpRequest>,
 ) -> ApiResult<Json<Value>> {
-    let source = source_row(&state, &user.workspace.id, &source_id).await?;
+    let (source, source_access) =
+        authorized_source_row(&state, &user, &source_id, Capability::SourceWrite).await?;
     let source_type: String = source.try_get("source_type")?;
     let sync_id = new_id("syn");
     sqlx::query(
         r#"
-        insert into sync_runs (id, workspace_id, data_source_id, sync_type, status, cursor, started_at)
-        values ($1, $2, $3, 'webhook_catch_up', 'running', $4, now())
+        insert into sync_runs (id, workspace_id, app_id, data_source_id, sync_type, status, cursor, started_at)
+        values ($1, $2, $3, $4, 'webhook_catch_up', 'running', $5, now())
         "#,
     )
     .bind(&sync_id)
-    .bind(&user.workspace.id)
+    .bind(&source_access.workspace_id)
+    .bind(&source_access.app_id)
     .bind(&source_id)
     .bind(input.cursor.as_deref())
     .execute(&state.pool)
+    .await?;
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&source_access.workspace_id),
+        Some(&source_access.app_id),
+        "source.catch_up_started",
+        Some("sync_run"),
+        Some(&sync_id),
+        json!({ "data_source_id": source_id }),
+    )
     .await?;
 
     let result =
@@ -583,13 +1326,14 @@ async fn catch_up_data_source(
     }
 
     Ok(Json(
-        json!({ "sync_run": get_sync_run_json(&state, &user.workspace.id, &sync_id).await? }),
+        json!({ "sync_run": get_sync_run_json(&state, &source_access.workspace_id, &sync_id).await? }),
     ))
 }
 
 async fn list_logical_products(
     State(state): State<AppState>,
     user: CurrentUser,
+    Query(filters): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
     let rows = sqlx::query(
         r#"
@@ -604,12 +1348,14 @@ async fn list_logical_products(
         from logical_products lp
         left join product_mappings pm on pm.logical_product_id = lp.id and pm.active = true
         left join source_products sp on sp.id = pm.source_product_id
-        where lp.workspace_id = $1
+        where has_app_permission($1, lp.app_id, 'app.read')
+          and ($2::text is null or lp.app_id = $2)
         group by lp.id
         order by lp.created_at desc
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&user.user.id)
+    .bind(filters.get("app_id"))
     .fetch_all(&state.pool)
     .await?;
     let products = rows
@@ -631,10 +1377,11 @@ async fn list_source_products(
         join data_sources ds on ds.id = sp.data_source_id
         left join product_mappings pm on pm.source_product_id = sp.id and pm.active = true
         left join logical_products lp on lp.id = pm.logical_product_id
-        where sp.workspace_id =
+        where has_app_permission(
         "#,
     );
-    query.push_bind(&user.workspace.id);
+    query.push_bind(&user.user.id);
+    query.push(", sp.app_id, 'app.read')");
     push_optional_filter(&mut query, "sp.app_id", filters.get("app_id"));
     push_optional_filter(
         &mut query,
@@ -683,7 +1430,8 @@ async fn confirm_catalog(
     _csrf: CsrfGuard,
     Json(input): Json<CatalogConfirmationRequest>,
 ) -> ApiResult<Json<Value>> {
-    ensure_app(&state, &user.workspace.id, &input.app_id).await?;
+    let app_access =
+        access::require_app(&state.pool, &user, &input.app_id, Capability::CatalogWrite).await?;
     if input.logical_products.is_empty() && input.ignored_source_product_ids.is_empty() {
         return Err(ApiError::invalid("nothing to confirm"));
     }
@@ -700,10 +1448,10 @@ async fn confirm_catalog(
                 r#"
                 update logical_products
                 set display_name = $3, product_kind = $4, billing_period = $5, reporting_category = $6, updated_at = now()
-                where workspace_id = $1 and id = $2
+                where app_id = $1 and id = $2
                 "#,
             )
-            .bind(&user.workspace.id)
+            .bind(&input.app_id)
             .bind(existing)
             .bind(draft.display_name.trim())
             .bind(&draft.product_kind)
@@ -724,7 +1472,7 @@ async fn confirm_catalog(
                 "#,
             )
             .bind(&id)
-            .bind(&user.workspace.id)
+            .bind(&app_access.workspace_id)
             .bind(&input.app_id)
             .bind(draft.display_name.trim())
             .bind(&draft.product_kind)
@@ -744,28 +1492,29 @@ async fn confirm_catalog(
             .ok_or_else(|| {
                 ApiError::invalid("mapping references an unknown logical product draft")
             })?;
-        sqlx::query("select id from source_products where workspace_id = $1 and id = $2")
-            .bind(&user.workspace.id)
+        sqlx::query("select id from source_products where app_id = $1 and id = $2")
+            .bind(&input.app_id)
             .bind(&mapping.source_product_id)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| ApiError::NotFound("source product not found".to_string()))?;
-        sqlx::query("update product_mappings set active = false where workspace_id = $1 and source_product_id = $2")
-            .bind(&user.workspace.id)
+        sqlx::query("update product_mappings set active = false where app_id = $1 and source_product_id = $2")
+            .bind(&input.app_id)
             .bind(&mapping.source_product_id)
             .execute(&mut *tx)
             .await?;
         sqlx::query(
             r#"
             insert into product_mappings (
-              id, workspace_id, source_product_id, logical_product_id, mapping_method,
+              id, workspace_id, app_id, source_product_id, logical_product_id, mapping_method,
               confidence, created_by_user_id, created_at, confirmed_at, active
             )
-            values ($1, $2, $3, $4, $5, 1, $6, now(), now(), true)
+            values ($1, $2, $3, $4, $5, $6, 1, $7, now(), now(), true)
             "#,
         )
         .bind(new_id("map"))
-        .bind(&user.workspace.id)
+        .bind(&app_access.workspace_id)
+        .bind(&input.app_id)
         .bind(&mapping.source_product_id)
         .bind(logical_product_id)
         .bind(
@@ -777,25 +1526,27 @@ async fn confirm_catalog(
         .bind(&user.user.id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("update source_products set mapping_state = 'mapped' where workspace_id = $1 and id = $2")
-            .bind(&user.workspace.id)
-            .bind(&mapping.source_product_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("update transactions set logical_product_id = $3 where workspace_id = $1 and source_product_id = $2")
-            .bind(&user.workspace.id)
-            .bind(&mapping.source_product_id)
-            .bind(logical_product_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("update subscriptions set logical_product_id = $3 where workspace_id = $1 and source_product_id = $2")
-            .bind(&user.workspace.id)
+        sqlx::query(
+            "update source_products set mapping_state = 'mapped' where app_id = $1 and id = $2",
+        )
+        .bind(&input.app_id)
+        .bind(&mapping.source_product_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("update transactions set logical_product_id = $3 where app_id = $1 and source_product_id = $2")
+            .bind(&input.app_id)
             .bind(&mapping.source_product_id)
             .bind(logical_product_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("update normalized_events set logical_product_id = $3 where workspace_id = $1 and source_product_id = $2")
-            .bind(&user.workspace.id)
+        sqlx::query("update subscriptions set logical_product_id = $3 where app_id = $1 and source_product_id = $2")
+            .bind(&input.app_id)
+            .bind(&mapping.source_product_id)
+            .bind(logical_product_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("update normalized_events set logical_product_id = $3 where app_id = $1 and source_product_id = $2")
+            .bind(&input.app_id)
             .bind(&mapping.source_product_id)
             .bind(logical_product_id)
             .execute(&mut *tx)
@@ -804,9 +1555,9 @@ async fn confirm_catalog(
 
     for ignored in &input.ignored_source_product_ids {
         sqlx::query(
-            "update source_products set mapping_state = 'ignored', ignored_at = now(), ignored_by_user_id = $3 where workspace_id = $1 and id = $2",
+            "update source_products set mapping_state = 'ignored', ignored_at = now(), ignored_by_user_id = $3 where app_id = $1 and id = $2",
         )
-        .bind(&user.workspace.id)
+        .bind(&input.app_id)
         .bind(ignored)
         .bind(&user.user.id)
         .execute(&mut *tx)
@@ -814,6 +1565,21 @@ async fn confirm_catalog(
     }
 
     tx.commit().await?;
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&app_access.workspace_id),
+        Some(&input.app_id),
+        "catalog.confirmed",
+        Some("app"),
+        Some(&input.app_id),
+        json!({
+            "logical_products": input.logical_products.len(),
+            "mappings": input.mappings.len(),
+            "ignored": input.ignored_source_product_ids.len()
+        }),
+    )
+    .await?;
     Ok(Json(json!({ "confirmed": true })))
 }
 
@@ -828,10 +1594,11 @@ async fn list_raw_events(
         from raw_events re
         join data_sources ds on ds.id = re.data_source_id
         left join source_products sp on sp.id = re.source_product_id
-        where re.workspace_id =
+        where has_app_permission(
         "#,
     );
-    query.push_bind(&user.workspace.id);
+    query.push_bind(&user.user.id);
+    query.push(", re.app_id, 'events.sensitive.read')");
     push_event_filters(&mut query, &filters, "re");
     query.push(" order by re.received_at desc limit 200");
     let rows = query.build().fetch_all(&state.pool).await?;
@@ -853,10 +1620,10 @@ async fn get_raw_event(
         from raw_events re
         join data_sources ds on ds.id = re.data_source_id
         left join source_products sp on sp.id = re.source_product_id
-        where re.workspace_id = $1 and re.id = $2
+        where re.id = $2 and has_app_permission($1, re.app_id, 'events.sensitive.read')
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&user.user.id)
     .bind(&event_id)
     .fetch_optional(&state.pool)
     .await?
@@ -875,10 +1642,11 @@ async fn list_normalized_events(
         from normalized_events ne
         left join source_products sp on sp.id = ne.source_product_id
         left join logical_products lp on lp.id = ne.logical_product_id
-        where ne.workspace_id =
+        where has_app_permission(
         "#,
     );
-    query.push_bind(&user.workspace.id);
+    query.push_bind(&user.user.id);
+    query.push(", ne.app_id, 'events.sensitive.read')");
     push_normalized_filters(&mut query, &filters);
     query.push(" order by ne.occurred_at desc limit 200");
     let rows = query.build().fetch_all(&state.pool).await?;
@@ -900,10 +1668,10 @@ async fn get_normalized_event(
         from normalized_events ne
         left join source_products sp on sp.id = ne.source_product_id
         left join logical_products lp on lp.id = ne.logical_product_id
-        where ne.workspace_id = $1 and ne.id = $2
+        where ne.id = $2 and has_app_permission($1, ne.app_id, 'events.sensitive.read')
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&user.user.id)
     .bind(&event_id)
     .fetch_optional(&state.pool)
     .await?
@@ -925,10 +1693,11 @@ async fn list_transactions(
         left join apps a on a.id = t.app_id
         left join source_products sp on sp.id = t.source_product_id
         left join logical_products lp on lp.id = t.logical_product_id
-        where t.workspace_id =
+        where has_app_permission(
         "#,
     );
-    query.push_bind(&user.workspace.id);
+    query.push_bind(&user.user.id);
+    query.push(", t.app_id, 'ledger.read')");
     push_transaction_filters(&mut query, &filters);
     query.push(" order by t.purchase_time desc limit 300");
     let rows = query.build().fetch_all(&state.pool).await?;
@@ -951,15 +1720,16 @@ async fn get_transaction(
         left join apps a on a.id = t.app_id
         left join source_products sp on sp.id = t.source_product_id
         left join logical_products lp on lp.id = t.logical_product_id
-        where t.workspace_id = $1 and t.id = $2
+        where t.id = $2 and has_app_permission($1, t.app_id, 'ledger.read')
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&user.user.id)
     .bind(&transaction_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("transaction not found".to_string()))?;
     let transaction_key: String = row.try_get("transaction_key")?;
+    let transaction_app_id: String = row.try_get("app_id")?;
     let evidence_event_id = row
         .try_get::<Option<String>, _>("created_from_event_id")?
         .or(row.try_get::<Option<String>, _>("latest_event_id")?);
@@ -968,7 +1738,7 @@ async fn get_transaction(
         select ne.id, ne.event_type, ne.environment, ne.occurred_at, ne.raw_event_id,
                ne.amount_minor, ne.currency, ne.warnings
         from normalized_events ne
-        where ne.workspace_id = $1
+        where ne.app_id = $1
           and ne.transaction_key = $2
           and ne.data_source_id = (
             select data_source_id from normalized_events where id = $3
@@ -976,7 +1746,7 @@ async fn get_transaction(
         order by ne.occurred_at desc
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&transaction_app_id)
     .bind(&transaction_key)
     .bind(evidence_event_id.as_deref())
     .fetch_all(&state.pool)
@@ -999,10 +1769,11 @@ async fn list_subscriptions(
         left join apps a on a.id = s.app_id
         left join source_products sp on sp.id = s.source_product_id
         left join logical_products lp on lp.id = s.logical_product_id
-        where s.workspace_id =
+        where has_app_permission(
         "#,
     );
-    query.push_bind(&user.workspace.id);
+    query.push_bind(&user.user.id);
+    query.push(", s.app_id, 'ledger.read')");
     push_optional_filter(&mut query, "s.status", filters.get("status"));
     push_optional_filter(&mut query, "s.app_id", filters.get("app_id"));
     push_optional_filter(&mut query, "s.platform", filters.get("platform"));
@@ -1038,24 +1809,25 @@ async fn get_subscription(
         left join apps a on a.id = s.app_id
         left join source_products sp on sp.id = s.source_product_id
         left join logical_products lp on lp.id = s.logical_product_id
-        where s.workspace_id = $1 and s.id = $2
+        where s.id = $2 and has_app_permission($1, s.app_id, 'ledger.read')
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&user.user.id)
     .bind(&subscription_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("subscription not found".to_string()))?;
     let subscription_key: String = row.try_get("subscription_key")?;
+    let subscription_app_id: String = row.try_get("app_id")?;
     let timeline = sqlx::query(
         r#"
         select id, event_type, environment, occurred_at, raw_event_id, amount_minor, currency, warnings
         from normalized_events
-        where workspace_id = $1 and subscription_key = $2
+        where app_id = $1 and subscription_key = $2
         order by occurred_at asc
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&subscription_app_id)
     .bind(subscription_key)
     .fetch_all(&state.pool)
     .await?;
@@ -1084,9 +1856,10 @@ async fn metrics_overview(
     let country = filters.get("country").map(String::as_str);
 
     let mut revenue = QueryBuilder::<Postgres>::new(
-        "select coalesce(sum(ne.amount_minor) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted','renewal')),0)::bigint as gross, coalesce(sum(abs(ne.amount_minor)) filter (where ne.event_type in ('refund','partial_refund','revocation')),0)::bigint as refunds, count(*) filter (where ne.event_type = 'renewal') as renewals from metric_events ne where ne.workspace_id = ",
+        "select coalesce(sum(ne.amount_minor) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted','renewal')),0)::bigint as gross, coalesce(sum(abs(ne.amount_minor)) filter (where ne.event_type in ('refund','partial_refund','revocation')),0)::bigint as refunds, count(*) filter (where ne.event_type = 'renewal') as renewals from metric_events ne where has_app_permission(",
     );
-    revenue.push_bind(&user.workspace.id);
+    revenue.push_bind(&user.user.id);
+    revenue.push(", ne.app_id, 'app.read')");
     revenue.push(" and ne.occurred_at::date between ");
     revenue.push_bind(from);
     revenue.push("::date and ");
@@ -1114,9 +1887,9 @@ async fn metrics_overview(
     subs.push_bind(from);
     subs.push("::date and ");
     subs.push_bind(to);
-    subs.push("::date) as churned from subscriptions where workspace_id = ");
-    subs.push_bind(&user.workspace.id);
-    subs.push(" and environment = 'production'");
+    subs.push("::date) as churned from subscriptions where has_app_permission(");
+    subs.push_bind(&user.user.id);
+    subs.push(", app_id, 'app.read') and environment = 'production'");
     push_optional_filter(&mut subs, "app_id", app_id);
     push_optional_filter(&mut subs, "platform", platform);
     push_optional_filter(&mut subs, "logical_product_id", product);
@@ -1124,7 +1897,7 @@ async fn metrics_overview(
     let active_subscriptions: i64 = subs_row.try_get("active")?;
     let new_subscriptions: i64 = subs_row.try_get("new_subs")?;
     let churned: i64 = subs_row.try_get("churned")?;
-    let warnings = metric_warnings(&state, &user.workspace.id).await?;
+    let warnings = metric_warnings(&state, &user.user.id, app_id).await?;
     let refund_rate = if gross <= 0 {
         0.0
     } else {
@@ -1172,9 +1945,9 @@ async fn metrics_revenue_timeseries(
     query.push_bind(from);
     query.push("::date, ");
     query.push_bind(to);
-    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date and ne.workspace_id = ");
-    query.push_bind(&user.workspace.id);
-    query.push(" and ne.environment = 'production' and ne.currency = ");
+    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date and has_app_permission(");
+    query.push_bind(&user.user.id);
+    query.push(", ne.app_id, 'app.read') and ne.environment = 'production' and ne.currency = ");
     query.push_bind(&currency);
     push_normalized_filters(&mut query, &filters);
     query.push(" group by d.date order by d.date asc");
@@ -1205,9 +1978,9 @@ async fn metrics_subscription_timeseries(
     query.push_bind(from);
     query.push("::date, ");
     query.push_bind(to);
-    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date and ne.workspace_id = ");
-    query.push_bind(&user.workspace.id);
-    query.push(" and ne.environment = 'production'");
+    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date and has_app_permission(");
+    query.push_bind(&user.user.id);
+    query.push(", ne.app_id, 'app.read') and ne.environment = 'production'");
     push_optional_filter(&mut query, "ne.app_id", filters.get("app_id"));
     push_optional_filter(&mut query, "ne.platform", filters.get("platform"));
     push_optional_filter(
@@ -1248,11 +2021,11 @@ async fn metrics_breakdown(
         left join logical_products lp on lp.id = ne.logical_product_id
         left join apps a on a.id = ne.app_id
         left join data_sources ds on ds.id = ne.data_source_id
-        where ne.workspace_id =
+        where has_app_permission(
         "#
     ));
-    query.push_bind(&user.workspace.id);
-    query.push(" and ne.occurred_at::date between ");
+    query.push_bind(&user.user.id);
+    query.push(", ne.app_id, 'app.read') and ne.occurred_at::date between ");
     query.push_bind(from);
     query.push("::date and ");
     query.push_bind(to);
@@ -1272,18 +2045,22 @@ async fn metrics_breakdown(
 async fn list_sync_runs(
     State(state): State<AppState>,
     user: CurrentUser,
+    Query(filters): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
     let rows = sqlx::query(
         r#"
         select sr.*, ds.name as data_source_name
         from sync_runs sr
         left join data_sources ds on ds.id = sr.data_source_id
-        where sr.workspace_id = $1
+        where sr.app_id is not null
+          and has_app_permission($1, sr.app_id, 'app.read')
+          and ($2::text is null or sr.app_id = $2)
         order by sr.started_at desc
         limit 100
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&user.user.id)
+    .bind(filters.get("app_id"))
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(
@@ -1297,14 +2074,20 @@ async fn get_sync_run(
     Path(sync_run_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     Ok(Json(
-        json!({ "sync_run": get_sync_run_json(&state, &user.workspace.id, &sync_run_id).await? }),
+        json!({ "sync_run": get_authorized_sync_run_json(&state, &user.user.id, &sync_run_id).await? }),
     ))
 }
 
-async fn list_jobs(State(state): State<AppState>, _user: CurrentUser) -> ApiResult<Json<Value>> {
+async fn list_jobs(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Query(filters): Query<HashMap<String, String>>,
+) -> ApiResult<Json<Value>> {
     let rows = sqlx::query(
-        "select * from jobs order by case status when 'failed' then 0 when 'dead' then 1 when 'running' then 2 else 3 end, created_at desc limit 200",
+        "select * from jobs where app_id is not null and has_app_permission($1, app_id, 'jobs.run') and ($2::text is null or app_id = $2) order by case status when 'failed' then 0 when 'dead' then 1 when 'running' then 2 else 3 end, created_at desc limit 200",
     )
+    .bind(&user.user.id)
+    .bind(filters.get("app_id"))
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(
@@ -1314,17 +2097,36 @@ async fn list_jobs(State(state): State<AppState>, _user: CurrentUser) -> ApiResu
 
 async fn retry_job(
     State(state): State<AppState>,
-    _user: CurrentUser,
+    user: CurrentUser,
     _csrf: CsrfGuard,
     Path(job_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    sqlx::query("update jobs set status = 'queued', run_after = now(), locked_at = null, locked_by = null, last_error = null where id = $1")
+    let app_id: String =
+        sqlx::query_scalar("select app_id from jobs where id = $1 and app_id is not null")
+            .bind(&job_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("job not found".to_string()))?;
+    let app_access = access::require_app(&state.pool, &user, &app_id, Capability::JobsRun).await?;
+    sqlx::query("update jobs set status = 'queued', run_after = now(), locked_at = null, locked_by = null, last_error = null where id = $1 and app_id = $2")
         .bind(&job_id)
+        .bind(&app_id)
         .execute(&state.pool)
         .await?;
     if let Err(error) = process_normalization_job(&state.pool, &job_id, "api-retry").await {
         tracing::warn!(?error, job_id, "job retry failed");
     }
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&app_access.workspace_id),
+        Some(&app_id),
+        "job.retried",
+        Some("job"),
+        Some(&job_id),
+        json!({}),
+    )
+    .await?;
     Ok(Json(json!({ "job": get_job_json(&state, &job_id).await? })))
 }
 
@@ -1336,6 +2138,7 @@ struct StoredWebhookPayload {
 
 struct WebhookStoreContext<'a> {
     workspace_id: &'a str,
+    app_id: &'a str,
     source_id: &'a str,
     source_type: &'a str,
     signature_verified: bool,
@@ -1352,6 +2155,7 @@ async fn run_webhook_catch_up(
     sync_run_id: &str,
 ) -> ApiResult<(i64, i64, Option<String>)> {
     let workspace_id: String = source.try_get("workspace_id")?;
+    let app_id: String = source.try_get("app_id")?;
     let encrypted_credentials: Option<String> = source.try_get("encrypted_credentials")?;
     let credentials = source_credentials(state, encrypted_credentials.as_deref())?;
     let window = catch_up_window(input)?;
@@ -1365,6 +2169,7 @@ async fn run_webhook_catch_up(
     let mut records_inserted = 0_i64;
     let store_context = WebhookStoreContext {
         workspace_id: &workspace_id,
+        app_id: &app_id,
         source_id,
         source_type,
         signature_verified: true,
@@ -1397,6 +2202,7 @@ async fn store_webhook_payload(
 ) -> ApiResult<StoredWebhookPayload> {
     let WebhookStoreContext {
         workspace_id,
+        app_id,
         source_id,
         source_type,
         signature_verified,
@@ -1413,17 +2219,18 @@ async fn store_webhook_payload(
     let inserted = sqlx::query(
         r#"
         insert into raw_events (
-          id, workspace_id, data_source_id, source_type, source_event_id, source_event_type, environment,
+          id, workspace_id, app_id, data_source_id, source_type, source_event_id, source_event_type, environment,
           source_app_id, occurred_at, received_at, payload, processing_payload, payload_sha256,
           signature_verified, processing_status, sync_run_id
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, $13, 'stored', $14)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), $11, $12, $13, $14, 'stored', $15)
         on conflict (data_source_id, source_event_id) do nothing
         returning id
         "#,
     )
     .bind(&raw_id)
     .bind(workspace_id)
+    .bind(app_id)
     .bind(source_id)
     .bind(source_type)
     .bind(&extracted.source_event_id)
@@ -1512,6 +2319,7 @@ async fn ingest_webhook(
         .await?
         .ok_or_else(|| ApiError::NotFound("data source not found".to_string()))?;
     let workspace_id: String = source.try_get("workspace_id")?;
+    let app_id: String = source.try_get("app_id")?;
     let secret_hash: Option<String> = source.try_get("webhook_secret_hash")?;
     let encrypted_credentials: Option<String> = source.try_get("encrypted_credentials")?;
     let credentials = optional_source_credentials(&state, encrypted_credentials.as_deref())?;
@@ -1572,6 +2380,7 @@ async fn ingest_webhook(
     };
     let store_context = WebhookStoreContext {
         workspace_id: &workspace_id,
+        app_id: &app_id,
         source_id: &source_id,
         source_type: &source_type,
         signature_verified,
@@ -1594,8 +2403,8 @@ async fn seed_demo(
     _csrf: CsrfGuard,
 ) -> ApiResult<Json<Value>> {
     let app_id = if let Some(row) =
-        sqlx::query("select id from apps where workspace_id = $1 order by created_at asc limit 1")
-            .bind(&user.workspace.id)
+        sqlx::query("select id from apps where owner_user_id = $1 and deleted_at is null order by created_at asc limit 1")
+            .bind(&user.user.id)
             .fetch_optional(&state.pool)
             .await?
     {
@@ -1603,16 +2412,17 @@ async fn seed_demo(
     } else {
         let app_id = new_id("app");
         sqlx::query(
-            "insert into apps (id, workspace_id, name, apple_bundle_id, google_package_name, default_currency, created_at, updated_at) values ($1, $2, 'Tiny Notes', 'com.example.tinynotes', 'com.example.tinynotes', 'USD', now(), now())",
+            "insert into apps (id, workspace_id, owner_user_id, created_by_user_id, name, apple_bundle_id, google_package_name, default_currency, created_at, updated_at) values ($1, $2, $3, $3, 'Tiny Notes', 'com.example.tinynotes', 'com.example.tinynotes', 'USD', now(), now())",
         )
         .bind(&app_id)
         .bind(&user.workspace.id)
+        .bind(&user.user.id)
         .execute(&state.pool)
         .await?;
         app_id
     };
-    let source_id = if let Some(row) = sqlx::query("select id from data_sources where workspace_id = $1 and source_type = 'revenuecat' order by created_at asc limit 1")
-        .bind(&user.workspace.id)
+    let source_id = if let Some(row) = sqlx::query("select id from data_sources where app_id = $1 and source_type = 'revenuecat' order by created_at asc limit 1")
+        .bind(&app_id)
         .fetch_optional(&state.pool)
         .await?
     {
@@ -1645,16 +2455,17 @@ async fn seed_demo(
         let row = sqlx::query(
             r#"
             insert into raw_events (
-              id, workspace_id, data_source_id, source_type, source_event_id, source_event_type, environment, source_app_id,
+              id, workspace_id, app_id, data_source_id, source_type, source_event_id, source_event_type, environment, source_app_id,
               occurred_at, received_at, payload, payload_sha256, signature_verified, processing_status
             )
-            values ($1, $2, $3, 'revenuecat', $4, $5, $6, $7, $8, now(), $9, $10, true, 'stored')
+            values ($1, $2, $3, $4, 'revenuecat', $5, $6, $7, $8, $9, now(), $10, $11, true, 'stored')
             on conflict (data_source_id, source_event_id) do nothing
             returning id
             "#,
         )
         .bind(&raw_id)
         .bind(&user.workspace.id)
+        .bind(&app_id)
         .bind(&source_id)
         .bind(&extracted.source_event_id)
         .bind(&extracted.source_event_type)
@@ -1684,7 +2495,13 @@ async fn seed_demo(
 async fn export_transactions_csv(
     State(state): State<AppState>,
     user: CurrentUser,
+    Query(filters): Query<HashMap<String, String>>,
 ) -> ApiResult<Response> {
+    let requested_access = if let Some(app_id) = filters.get("app_id") {
+        Some(access::require_app(&state.pool, &user, app_id, Capability::ExportRun).await?)
+    } else {
+        None
+    };
     let rows = sqlx::query(
         r#"
         select t.purchase_time, t.transaction_key, t.source_type, t.platform, t.environment, coalesce(lp.display_name, sp.display_name, 'Unmapped') as product,
@@ -1692,11 +2509,13 @@ async fn export_transactions_csv(
         from transactions t
         left join source_products sp on sp.id = t.source_product_id
         left join logical_products lp on lp.id = t.logical_product_id
-        where t.workspace_id = $1
+        where has_app_permission($1, t.app_id, 'export.run')
+          and ($2::text is null or t.app_id = $2)
         order by t.purchase_time desc
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(&user.user.id)
+    .bind(filters.get("app_id"))
     .fetch_all(&state.pool)
     .await?;
     let mut csv = String::from(
@@ -1725,6 +2544,17 @@ async fn export_transactions_csv(
         csv.push_str(&line);
         csv.push('\n');
     }
+    access::audit(
+        &state.pool,
+        &user,
+        requested_access.as_ref().map(|access| access.workspace_id.as_str()),
+        requested_access.as_ref().map(|access| access.app_id.as_str()),
+        "transactions.exported",
+        Some("portfolio"),
+        None,
+        json!({ "row_count": csv.lines().count().saturating_sub(1), "app_id": filters.get("app_id") }),
+    )
+    .await?;
     Ok((
         StatusCode::OK,
         [
@@ -1741,9 +2571,17 @@ async fn export_transactions_csv(
 
 fn auth_mode_name(mode: &AuthMode) -> &'static str {
     match mode {
-        AuthMode::SingleUser => "single_user",
+        AuthMode::Local => "local",
         AuthMode::ReverseProxy => "reverse_proxy",
         AuthMode::Disabled => "disabled",
+    }
+}
+
+fn registration_mode_name(mode: &RegistrationMode) -> &'static str {
+    match mode {
+        RegistrationMode::Closed => "closed",
+        RegistrationMode::InviteOnly => "invite_only",
+        RegistrationMode::Open => "open",
     }
 }
 
@@ -1769,24 +2607,34 @@ fn normalize_source_type(source_type: &str) -> ApiResult<String> {
     })
 }
 
-async fn ensure_app(state: &AppState, workspace_id: &str, app_id: &str) -> ApiResult<()> {
-    sqlx::query("select id from apps where workspace_id = $1 and id = $2")
-        .bind(workspace_id)
-        .bind(app_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("app not found".to_string()))?;
-    Ok(())
-}
-
-async fn get_app_json(state: &AppState, workspace_id: &str, app_id: &str) -> ApiResult<Value> {
-    let row = sqlx::query("select * from apps where workspace_id = $1 and id = $2")
-        .bind(workspace_id)
-        .bind(app_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("app not found".to_string()))?;
-    app_json(row)
+async fn get_app_for_user_json(state: &AppState, user_id: &str, app_id: &str) -> ApiResult<Value> {
+    let row = sqlx::query(
+        r#"
+        select a.id, a.workspace_id, a.owner_user_id, a.name, a.platform_bundle_id,
+               a.apple_bundle_id, a.google_package_name, a.default_currency,
+               a.created_at, a.updated_at,
+               case
+                 when a.owner_user_id = $1 then 'owner'
+                 when wu.role in ('owner', 'admin') then 'workspace_admin'
+                 else coalesce(ar.role_key, 'viewer')
+               end as access_role,
+               array_agg(distinct eap.permission order by eap.permission) as permissions
+        from apps a
+        join effective_app_permissions eap on eap.app_id = a.id and eap.user_id = $1
+        left join workspace_users wu
+          on wu.workspace_id = a.workspace_id and wu.user_id = $1 and wu.status = 'active'
+        left join app_memberships am on am.app_id = a.id and am.user_id = $1
+        left join app_roles ar on ar.id = am.role_id
+        where a.id = $2 and a.deleted_at is null
+        group by a.id, wu.role, ar.role_key
+        "#,
+    )
+    .bind(user_id)
+    .bind(app_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("app not found".to_string()))?;
+    app_with_access_json(row)
 }
 
 async fn source_row(
@@ -1800,6 +2648,22 @@ async fn source_row(
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(|| ApiError::NotFound("data source not found".to_string()))
+}
+
+async fn authorized_source_row(
+    state: &AppState,
+    user: &CurrentUser,
+    source_id: &str,
+    capability: Capability,
+) -> ApiResult<(sqlx::postgres::PgRow, access::AppAccess)> {
+    let app_id: String = sqlx::query_scalar("select app_id from data_sources where id = $1")
+        .bind(source_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("data source not found".to_string()))?;
+    let app_access = access::require_app(&state.pool, user, &app_id, capability).await?;
+    let row = source_row(state, &app_access.workspace_id, source_id).await?;
+    Ok((row, app_access))
 }
 
 async fn get_data_source_json(
@@ -1844,6 +2708,29 @@ async fn get_sync_run_json(
     sync_run_json(row)
 }
 
+async fn get_authorized_sync_run_json(
+    state: &AppState,
+    user_id: &str,
+    sync_run_id: &str,
+) -> ApiResult<Value> {
+    let row = sqlx::query(
+        r#"
+        select sr.*, ds.name as data_source_name
+        from sync_runs sr
+        left join data_sources ds on ds.id = sr.data_source_id
+        where sr.id = $2
+          and sr.app_id is not null
+          and has_app_permission($1, sr.app_id, 'app.read')
+        "#,
+    )
+    .bind(user_id)
+    .bind(sync_run_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("sync run not found".to_string()))?;
+    sync_run_json(row)
+}
+
 async fn get_job_json(state: &AppState, job_id: &str) -> ApiResult<Value> {
     let row = sqlx::query("select * from jobs where id = $1")
         .bind(job_id)
@@ -1859,9 +2746,9 @@ async fn auto_confirm_demo_products(
     app_id: &str,
 ) -> ApiResult<()> {
     let rows = sqlx::query(
-        "select * from source_products where workspace_id = $1 and mapping_state = 'unmapped' order by first_seen_at asc",
+        "select * from source_products where app_id = $1 and mapping_state = 'unmapped' order by first_seen_at asc",
     )
-    .bind(&user.workspace.id)
+    .bind(app_id)
     .fetch_all(&state.pool)
     .await?;
     for row in rows {
@@ -1888,36 +2775,39 @@ async fn auto_confirm_demo_products(
         .execute(&state.pool)
         .await?;
         sqlx::query(
-            "insert into product_mappings (id, workspace_id, source_product_id, logical_product_id, mapping_method, confidence, created_by_user_id, created_at, confirmed_at, active) values ($1, $2, $3, $4, 'demo_seed', 1, $5, now(), now(), true)",
+            "insert into product_mappings (id, workspace_id, app_id, source_product_id, logical_product_id, mapping_method, confidence, created_by_user_id, created_at, confirmed_at, active) values ($1, $2, $3, $4, $5, 'demo_seed', 1, $6, now(), now(), true)",
         )
         .bind(new_id("map"))
         .bind(&user.workspace.id)
+        .bind(app_id)
         .bind(&source_product_id)
         .bind(&lp_id)
         .bind(&user.user.id)
         .execute(&state.pool)
         .await?;
-        sqlx::query("update source_products set mapping_state = 'mapped' where workspace_id = $1 and id = $2")
-            .bind(&user.workspace.id)
-            .bind(&source_product_id)
-            .execute(&state.pool)
-            .await?;
-        sqlx::query("update transactions set logical_product_id = $3 where workspace_id = $1 and source_product_id = $2")
-            .bind(&user.workspace.id)
+        sqlx::query(
+            "update source_products set mapping_state = 'mapped' where app_id = $1 and id = $2",
+        )
+        .bind(app_id)
+        .bind(&source_product_id)
+        .execute(&state.pool)
+        .await?;
+        sqlx::query("update transactions set logical_product_id = $3 where app_id = $1 and source_product_id = $2")
+            .bind(app_id)
             .bind(&source_product_id)
             .bind(&lp_id)
             .execute(&state.pool)
             .await?;
         sqlx::query(
-            "update subscriptions set logical_product_id = $3 where workspace_id = $1 and source_product_id = $2",
+            "update subscriptions set logical_product_id = $3 where app_id = $1 and source_product_id = $2",
         )
-        .bind(&user.workspace.id)
+        .bind(app_id)
         .bind(&source_product_id)
         .bind(&lp_id)
         .execute(&state.pool)
         .await?;
-        sqlx::query("update normalized_events set logical_product_id = $3 where workspace_id = $1 and source_product_id = $2")
-            .bind(&user.workspace.id)
+        sqlx::query("update normalized_events set logical_product_id = $3 where app_id = $1 and source_product_id = $2")
+            .bind(app_id)
             .bind(&source_product_id)
             .bind(&lp_id)
             .execute(&state.pool)
@@ -1928,76 +2818,92 @@ async fn auto_confirm_demo_products(
         update normalized_events ne
         set logical_product_id = pm.logical_product_id
         from product_mappings pm
-        where ne.workspace_id = $1
-          and pm.workspace_id = $1
+        where ne.app_id = $1
+          and pm.app_id = $1
           and pm.source_product_id = ne.source_product_id
           and pm.active = true
           and ne.logical_product_id is null
         "#,
     )
-    .bind(&user.workspace.id)
+    .bind(app_id)
     .execute(&state.pool)
     .await?;
     Ok(())
 }
 
-async fn metric_warnings(state: &AppState, workspace_id: &str) -> ApiResult<Vec<String>> {
-    let unmapped: i64 = sqlx::query_scalar("select count(*) from source_products where workspace_id = $1 and mapping_state = 'unmapped'")
-        .bind(workspace_id)
+async fn metric_warnings(
+    state: &AppState,
+    user_id: &str,
+    app_id: Option<&str>,
+) -> ApiResult<Vec<String>> {
+    let unmapped: i64 = sqlx::query_scalar("select count(*) from source_products where has_app_permission($1, app_id, 'app.read') and ($2::text is null or app_id = $2) and mapping_state = 'unmapped'")
+        .bind(user_id)
+        .bind(app_id)
         .fetch_one(&state.pool)
         .await?;
     let failed_jobs: i64 =
-        sqlx::query_scalar("select count(*) from jobs where status in ('failed','dead')")
+        sqlx::query_scalar("select count(*) from jobs where app_id is not null and has_app_permission($1, app_id, 'app.read') and ($2::text is null or app_id = $2) and status in ('failed','dead')")
+            .bind(user_id)
+            .bind(app_id)
             .fetch_one(&state.pool)
             .await?;
     let source_count: i64 =
-        sqlx::query_scalar("select count(*) from data_sources where workspace_id = $1")
-            .bind(workspace_id)
+        sqlx::query_scalar("select count(*) from data_sources where has_app_permission($1, app_id, 'app.read') and ($2::text is null or app_id = $2)")
+            .bind(user_id)
+            .bind(app_id)
             .fetch_one(&state.pool)
             .await?;
     let transaction_count: i64 =
-        sqlx::query_scalar("select count(*) from transactions where workspace_id = $1")
-            .bind(workspace_id)
+        sqlx::query_scalar("select count(*) from transactions where has_app_permission($1, app_id, 'app.read') and ($2::text is null or app_id = $2)")
+            .bind(user_id)
+            .bind(app_id)
             .fetch_one(&state.pool)
             .await?;
     let non_production_transactions: i64 = sqlx::query_scalar(
-        "select count(*) from transactions where workspace_id = $1 and environment <> 'production'",
+        "select count(*) from transactions where has_app_permission($1, app_id, 'app.read') and ($2::text is null or app_id = $2) and environment <> 'production'",
     )
-    .bind(workspace_id)
+    .bind(user_id)
+    .bind(app_id)
     .fetch_one(&state.pool)
     .await?;
     let unknown_transactions: i64 = sqlx::query_scalar(
-        "select count(*) from transactions where workspace_id = $1 and environment = 'unknown'",
+        "select count(*) from transactions where has_app_permission($1, app_id, 'app.read') and ($2::text is null or app_id = $2) and environment = 'unknown'",
     )
-    .bind(workspace_id)
+    .bind(user_id)
+    .bind(app_id)
     .fetch_one(&state.pool)
     .await?;
     let incomplete_money_events: i64 = sqlx::query_scalar(
         r#"
         select count(*)
         from normalized_events
-        where workspace_id = $1
+        where has_app_permission($1, app_id, 'app.read')
+          and ($2::text is null or app_id = $2)
           and environment = 'production'
           and event_type in ('purchase','one_time_purchase','trial_converted','renewal','refund','partial_refund','revocation')
           and (amount_minor is null or currency is null or currency = 'UNKNOWN')
         "#,
     )
-    .bind(workspace_id)
+    .bind(user_id)
+    .bind(app_id)
     .fetch_one(&state.pool)
     .await?;
     let duplicate_groups: i64 = sqlx::query_scalar(
         r#"
         select count(*)
         from (
-          select ne.event_type, ne.transaction_key
+          select ne.app_id, ne.event_type, ne.transaction_key
           from normalized_events ne
-          where ne.workspace_id = $1 and ne.transaction_key is not null
-          group by ne.event_type, ne.transaction_key
+          where has_app_permission($1, ne.app_id, 'app.read')
+            and ($2::text is null or ne.app_id = $2)
+            and ne.transaction_key is not null
+          group by ne.app_id, ne.event_type, ne.transaction_key
           having count(distinct ne.data_source_id) > 1
         ) duplicates
         "#,
     )
-    .bind(workspace_id)
+    .bind(user_id)
+    .bind(app_id)
     .fetch_one(&state.pool)
     .await?;
     let mut warnings = vec![];
@@ -2320,14 +3226,18 @@ fn push_transaction_filters<'a>(
     }
 }
 
-fn app_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
+fn app_with_access_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
     Ok(json!({
         "id": row.try_get::<String, _>("id")?,
+        "workspace_id": row.try_get::<String, _>("workspace_id")?,
+        "owner_user_id": row.try_get::<String, _>("owner_user_id")?,
         "name": row.try_get::<String, _>("name")?,
         "platform_bundle_id": row.try_get::<Option<String>, _>("platform_bundle_id")?,
         "apple_bundle_id": row.try_get::<Option<String>, _>("apple_bundle_id")?,
         "google_package_name": row.try_get::<Option<String>, _>("google_package_name")?,
         "default_currency": row.try_get::<Option<String>, _>("default_currency")?,
+        "role": row.try_get::<String, _>("access_role")?,
+        "permissions": row.try_get::<Vec<String>, _>("permissions")?,
         "created_at": dt(row.try_get::<OffsetDateTime, _>("created_at")?),
         "updated_at": dt(row.try_get::<OffsetDateTime, _>("updated_at")?),
     }))
@@ -2478,6 +3388,7 @@ fn raw_event_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
     Ok(json!({
         "id": row.try_get::<String, _>("id")?,
         "workspace_id": row.try_get::<String, _>("workspace_id")?,
+        "app_id": row.try_get::<String, _>("app_id")?,
         "data_source_id": row.try_get::<String, _>("data_source_id")?,
         "data_source_name": row.try_get::<Option<String>, _>("data_source_name").ok().flatten(),
         "source_type": row.try_get::<String, _>("source_type")?,
@@ -2634,6 +3545,7 @@ fn sync_run_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
     Ok(json!({
         "id": row.try_get::<String, _>("id")?,
         "workspace_id": row.try_get::<String, _>("workspace_id")?,
+        "app_id": row.try_get::<Option<String>, _>("app_id")?,
         "data_source_id": row.try_get::<Option<String>, _>("data_source_id")?,
         "data_source_name": row.try_get::<Option<String>, _>("data_source_name").ok().flatten(),
         "sync_type": row.try_get::<String, _>("sync_type")?,
@@ -2650,6 +3562,8 @@ fn sync_run_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
 fn job_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
     Ok(json!({
         "id": row.try_get::<String, _>("id")?,
+        "workspace_id": row.try_get::<Option<String>, _>("workspace_id")?,
+        "app_id": row.try_get::<Option<String>, _>("app_id")?,
         "queue": row.try_get::<String, _>("queue")?,
         "job_type": row.try_get::<String, _>("job_type")?,
         "payload": row.try_get::<Value, _>("payload")?,

@@ -53,7 +53,7 @@ export default function ConnectScreen() {
             <View style={styles.intro}>
               <ThemedText type="subtitle">Connect your server</ThemedText>
               <ThemedText themeColor="textSecondary">
-                Use the same address and owner account as your self-hosted dashboard.
+                Use the same server address and local account as your self-hosted dashboard.
               </ThemedText>
             </View>
 

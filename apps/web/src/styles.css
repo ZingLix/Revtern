@@ -121,6 +121,23 @@ textarea {
   display: grid;
 }
 
+.sidebar-app-switcher {
+  display: grid;
+  gap: 6px;
+  padding: 0 6px;
+}
+
+.sidebar-app-switcher > span,
+.sidebar-app-switcher > small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.sidebar-app-switcher .select-control {
+  min-width: 0;
+  width: 100%;
+}
+
 .nav-list {
   display: grid;
   gap: 3px;
@@ -340,6 +357,145 @@ pre {
 .settings-actions {
   display: grid;
   gap: 12px;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+  align-items: start;
+  gap: 18px;
+}
+
+.settings-span {
+  grid-column: 1 / -1;
+}
+
+.permission-summary,
+.identity-list,
+.pending-invitations {
+  display: grid;
+  gap: 10px;
+}
+
+.permission-summary p {
+  margin: 0;
+}
+
+.permission-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.identity-row,
+.pending-invitation {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--separator);
+}
+
+.identity-row:last-child,
+.pending-invitation:last-child {
+  border-bottom: 0;
+}
+
+.identity-row > div,
+.pending-invitation > div,
+.member-identity {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.identity-row span,
+.pending-invitation span,
+.member-identity span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+}
+
+.invite-form {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(180px, 0.5fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.role-guide {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-top: 1px solid var(--separator);
+  border-bottom: 1px solid var(--separator);
+}
+
+.role-guide > div {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border-right: 1px solid var(--separator);
+}
+
+.role-guide > div:last-child {
+  border-right: 0;
+}
+
+.role-guide strong,
+.pending-invitations h3 {
+  font-size: 13px;
+}
+
+.role-guide span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pending-invitations h3 {
+  margin: 6px 0 0;
+}
+
+.invite-url {
+  display: block;
+  max-width: min(680px, 100%);
+  margin-top: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-provider-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--separator);
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.auth-provider-link:hover {
+  background: var(--default);
+}
+
+.auth-note,
+.invitation-screen p {
+  margin: 0;
+}
+
+.eyebrow {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .source-card,
@@ -849,6 +1005,22 @@ pre {
     grid-template-columns: 1fr 1fr;
   }
 
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-span {
+    grid-column: auto;
+  }
+
+  .role-guide {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .role-guide > div:nth-child(2) {
+    border-right: 0;
+  }
+
   .overview-grid {
     grid-template-columns: 1fr;
   }
@@ -897,8 +1069,19 @@ pre {
 
   .two-column,
   .draft-form-grid,
-  .inline-form {
+  .inline-form,
+  .invite-form,
+  .role-guide {
     grid-template-columns: 1fr;
+  }
+
+  .role-guide > div {
+    border-right: 0;
+    border-bottom: 1px solid var(--separator);
+  }
+
+  .role-guide > div:last-child {
+    border-bottom: 0;
   }
 
   .filter-bar .select-control,

@@ -1,10 +1,15 @@
 import type {
   AppRecord,
+  AppMembersResponse,
+  AppInvitationRecord,
+  AuthIdentitiesResponse,
+  AuthProvidersResponse,
   DataSourceRecord,
   DailyRevenuePoint,
   DailySubscriptionPoint,
   Id,
   JobRecord,
+  InvitationPreview,
   LogicalProductRecord,
   MeResponse,
   NormalizedEventRecord,
@@ -77,6 +82,26 @@ export class RevternApi {
     return this.post<{ created: boolean }>("/api/setup/owner", input);
   }
 
+  authProviders() {
+    return this.get<AuthProvidersResponse>("/api/auth/providers");
+  }
+
+  authIdentities() {
+    return this.get<AuthIdentitiesResponse>("/api/auth/identities");
+  }
+
+  register(input: { email: string; password: string; display_name?: string; invite_token?: string }) {
+    return this.post<{ created: boolean; user_id: Id; workspace_id: Id; accepted_app_id?: Id | null }>("/api/registration", input);
+  }
+
+  invitation(token: string) {
+    return this.get<{ invitation: InvitationPreview }>(`/api/invitations/${encodeURIComponent(token)}`);
+  }
+
+  acceptInvitation(token: string) {
+    return this.post<{ accepted: boolean; app_id: Id }>(`/api/invitations/${encodeURIComponent(token)}`, {});
+  }
+
   login(input: { email: string; password: string }) {
     return this.post<{ logged_in: boolean }>("/api/session", input);
   }
@@ -109,8 +134,28 @@ export class RevternApi {
     return this.patch<{ app: AppRecord }>(`/api/apps/${id}`, input);
   }
 
-  dataSources() {
-    return this.get<{ data_sources: DataSourceRecord[] }>("/api/data-sources");
+  appMembers(id: Id) {
+    return this.get<AppMembersResponse>(`/api/apps/${id}/members`);
+  }
+
+  inviteAppMember(id: Id, input: { email: string; role: string }) {
+    return this.post<{ invitation: AppInvitationRecord }>(`/api/apps/${id}/invitations`, input);
+  }
+
+  revokeAppInvitation(appId: Id, invitationId: Id) {
+    return this.delete<{ revoked: boolean }>(`/api/apps/${appId}/invitations/${invitationId}`);
+  }
+
+  updateAppMember(appId: Id, userId: Id, input: { role: string }) {
+    return this.patch<{ updated: boolean }>(`/api/apps/${appId}/members/${userId}`, input);
+  }
+
+  removeAppMember(appId: Id, userId: Id) {
+    return this.delete<{ removed: boolean }>(`/api/apps/${appId}/members/${userId}`);
+  }
+
+  dataSources(params: Record<string, string | undefined> = {}) {
+    return this.get<{ data_sources: DataSourceRecord[] }>(`/api/data-sources${query(params)}`);
   }
 
   createDataSource(input: { source_type: string; name: string; app_id?: Id | null; credentials?: Record<string, unknown> }) {
@@ -129,8 +174,8 @@ export class RevternApi {
     return this.post<{ sync_run: SyncRunRecord }>(`/api/data-sources/${id}/catch-up`, input);
   }
 
-  logicalProducts() {
-    return this.get<{ logical_products: LogicalProductRecord[] }>("/api/products/logical");
+  logicalProducts(params: Record<string, string | undefined> = {}) {
+    return this.get<{ logical_products: LogicalProductRecord[] }>(`/api/products/logical${query(params)}`);
   }
 
   sourceProducts(params: Record<string, string | undefined> = {}) {
@@ -183,12 +228,12 @@ export class RevternApi {
     );
   }
 
-  syncRuns() {
-    return this.get<{ sync_runs: SyncRunRecord[] }>("/api/sync-runs");
+  syncRuns(params: Record<string, string | undefined> = {}) {
+    return this.get<{ sync_runs: SyncRunRecord[] }>(`/api/sync-runs${query(params)}`);
   }
 
-  jobs() {
-    return this.get<{ jobs: JobRecord[] }>("/api/jobs");
+  jobs(params: Record<string, string | undefined> = {}) {
+    return this.get<{ jobs: JobRecord[] }>(`/api/jobs${query(params)}`);
   }
 
   retryJob(id: Id) {
@@ -201,6 +246,14 @@ export class RevternApi {
 
   webhookUrl(sourceType: string, sourceId: Id) {
     return `${this.baseUrl}/webhooks/${sourceType.replaceAll("_", "-")}/${sourceId}`;
+  }
+
+  oidcStartUrl(input: { returnTo?: string; inviteToken?: string; link?: boolean } = {}) {
+    const search = new URLSearchParams();
+    if (input.returnTo) search.set("return_to", input.returnTo);
+    if (input.inviteToken) search.set("invite_token", input.inviteToken);
+    const suffix = search.size ? `?${search.toString()}` : "";
+    return `${this.baseUrl}/api/auth/oidc/${input.link ? "link" : "start"}${suffix}`;
   }
 
   private get<T>(path: string) {

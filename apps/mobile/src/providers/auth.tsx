@@ -1,19 +1,24 @@
 import { RevternApi } from '@revtern/api-client';
-import type { MeResponse } from '@revtern/types';
+import type { AppRecord, MeResponse } from '@revtern/types';
 import * as SecureStore from 'expo-secure-store';
 import { createContext, type ReactNode, useContext, useEffect, useMemo, useState } from 'react';
 
 const SERVER_KEY = 'revtern.server-url';
 const TOKEN_KEY = 'revtern.access-token';
+const APP_KEY = 'revtern.app-id';
 
 type AuthContextValue = {
   api: RevternApi | null;
   connected: boolean;
   profile: MeResponse | null;
+  apps: AppRecord[];
+  selectedApp: AppRecord | null;
+  selectedAppId: string | null;
   ready: boolean;
   serverUrl: string | null;
   connect: (input: { serverUrl: string; email: string; password: string }) => Promise<void>;
   disconnect: () => Promise<void>;
+  selectApp: (appId: string) => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -22,6 +27,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [serverUrl, setServerUrl] = useState<string | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [profile, setProfile] = useState<MeResponse | null>(null);
+  const [apps, setApps] = useState<AppRecord[]>([]);
+  const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
   const api = useMemo(
@@ -35,9 +42,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let active = true;
     void (async () => {
-      const [storedServer, storedToken] = await Promise.all([
+      const [storedServer, storedToken, storedAppId] = await Promise.all([
         SecureStore.getItemAsync(SERVER_KEY),
         SecureStore.getItemAsync(TOKEN_KEY),
+        SecureStore.getItemAsync(APP_KEY),
       ]);
       if (!active) return;
       if (!storedServer) {
@@ -49,11 +57,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         accessToken: () => storedToken,
       });
       try {
-        const me = await restoredApi.me();
+        const [me, appResponse] = await Promise.all([restoredApi.me(), restoredApi.apps()]);
         if (!active) return;
+        const nextAppId = appResponse.apps.some((app) => app.id === storedAppId)
+          ? storedAppId
+          : appResponse.apps[0]?.id ?? null;
         setServerUrl(storedServer);
         setToken(storedToken);
         setProfile(me);
+        setApps(appResponse.apps);
+        setSelectedAppId(nextAppId);
+        if (nextAppId) await SecureStore.setItemAsync(APP_KEY, nextAppId);
       } catch {
         await Promise.all([
           SecureStore.deleteItemAsync(SERVER_KEY),
@@ -77,7 +91,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
 
     let nextToken: string | null = null;
-    if (setup.auth_mode === 'single_user') {
+    if (setup.auth_mode === 'local') {
       if (!input.email.trim() || !input.password) {
         throw new Error('Email and password are required for this server.');
       }
@@ -94,13 +108,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       baseUrl: normalizedUrl,
       accessToken: () => nextToken,
     });
-    const me = await nextApi.me();
+    const [me, appResponse] = await Promise.all([nextApi.me(), nextApi.apps()]);
+    const nextAppId = appResponse.apps[0]?.id ?? null;
     await SecureStore.setItemAsync(SERVER_KEY, normalizedUrl);
     if (nextToken) await SecureStore.setItemAsync(TOKEN_KEY, nextToken);
     else await SecureStore.deleteItemAsync(TOKEN_KEY);
+    if (nextAppId) await SecureStore.setItemAsync(APP_KEY, nextAppId);
+    else await SecureStore.deleteItemAsync(APP_KEY);
     setServerUrl(normalizedUrl);
     setToken(nextToken);
     setProfile(me);
+    setApps(appResponse.apps);
+    setSelectedAppId(nextAppId);
   }
 
   async function disconnect() {
@@ -112,20 +131,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await Promise.all([
       SecureStore.deleteItemAsync(SERVER_KEY),
       SecureStore.deleteItemAsync(TOKEN_KEY),
+      SecureStore.deleteItemAsync(APP_KEY),
     ]);
     setProfile(null);
     setToken(null);
     setServerUrl(null);
+    setApps([]);
+    setSelectedAppId(null);
+  }
+
+  async function selectApp(appId: string) {
+    if (!apps.some((app) => app.id === appId)) throw new Error('This app is no longer available.');
+    await SecureStore.setItemAsync(APP_KEY, appId);
+    setSelectedAppId(appId);
   }
 
   const value: AuthContextValue = {
     api,
     connected: Boolean(serverUrl && profile),
     profile,
+    apps,
+    selectedApp: apps.find((app) => app.id === selectedAppId) ?? null,
+    selectedAppId,
     ready,
     serverUrl,
     connect,
     disconnect,
+    selectApp,
   };
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

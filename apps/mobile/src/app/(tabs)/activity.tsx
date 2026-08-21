@@ -5,22 +5,23 @@ import { useRouter } from 'expo-router';
 import { NativeListScreen } from '@/components/native-list-screen';
 import { useTheme } from '@/hooks/use-theme';
 import { formatDateTime, formatMoney, formatStatus, last30Days } from '@/lib/format';
-import { useApi } from '@/providers/auth';
+import { useApi, useAuth } from '@/providers/auth';
 
 const period = last30Days();
 
 export default function ActivityScreen() {
   const api = useApi();
+  const { selectedApp, selectedAppId } = useAuth();
   const router = useRouter();
   const theme = useTheme();
   const transactions = useQuery({
-    queryKey: ['transactions', period],
-    queryFn: () => api.transactions(period),
+    queryKey: ['transactions', period, selectedAppId],
+    queryFn: () => api.transactions({ ...period, app_id: selectedAppId ?? undefined }),
   });
   const items = transactions.data?.transactions ?? [];
 
   return (
-    <NativeListScreen subtitle="Production and verified events" title="Activity">
+    <NativeListScreen subtitle={selectedApp ? `${selectedApp.name} · Production` : 'Production and verified events'} title="Activity">
       <List onRefresh={async () => void (await transactions.refetch())}>
         {transactions.error ? (
           <ListItem supportingText={transactions.error.message}>Couldn’t load transactions</ListItem>

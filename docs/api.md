@@ -12,7 +12,10 @@
 
 ```text
 /api/setup
+/api/registration
 /api/session
+/api/auth
+/api/invitations
 /api/me
 /api/apps
 /api/products
@@ -37,7 +40,9 @@ Response:
 ```json
 {
   "needs_setup": true,
-  "auth_mode": "single_user"
+  "auth_mode": "local",
+  "registration_mode": "invite_only",
+  "oidc": null
 }
 ```
 
@@ -56,6 +61,38 @@ Request:
 ```
 
 ## Session
+
+### GET /api/auth/providers
+
+Returns enabled local/OIDC sign-in methods and the registration mode.
+
+### GET /api/auth/oidc/start
+
+Starts OIDC Authorization Code + PKCE login. Optional `return_to` must be a
+local path. An optional `invite_token` carries an app invitation through first
+sign-in.
+
+### GET /api/auth/oidc/link
+
+Starts explicit OIDC linking for the authenticated account.
+
+### GET /api/auth/identities
+
+Lists sign-in methods linked to the current account.
+
+### POST /api/registration
+
+Creates a local account when registration policy permits it. In `invite_only`
+mode, `invite_token` is required and is accepted in the same transaction.
+
+### GET /api/invitations/{token}
+
+Returns the public invitation preview without granting app access.
+
+### POST /api/invitations/{token}
+
+Accepts an invitation for the authenticated account whose normalized email
+matches the invitation.
 
 ### POST /api/session
 
@@ -77,7 +114,7 @@ Logs out the current session.
 ### POST /api/mobile/session
 
 Creates a 30-day bearer session for an iOS or Android device. This endpoint is
-available in `single_user` auth mode and returns an opaque access token. The
+available in `local` auth mode and returns an opaque access token. The
 server stores only its hash.
 
 Request:
@@ -130,7 +167,8 @@ Response:
 
 ### GET /api/apps
 
-Lists apps.
+Lists only apps the current user can access. Each record includes `role` and the
+effective `permissions` array.
 
 ### POST /api/apps
 
@@ -149,6 +187,24 @@ Request:
 ### PATCH /api/apps/{app_id}
 
 Updates app metadata.
+
+### GET /api/apps/{app_id}/members
+
+Lists app members, pending invitations, and assignable roles. Requires
+`members.manage`.
+
+### POST /api/apps/{app_id}/invitations
+
+Creates or replaces a pending email-bound invitation. The plaintext invitation
+URL is returned once; only its hash is stored.
+
+### PATCH /api/apps/{app_id}/members/{user_id}
+
+Changes an explicit app member role.
+
+### DELETE /api/apps/{app_id}/members/{user_id}
+
+Removes explicit shared access.
 
 ## Data Sources
 

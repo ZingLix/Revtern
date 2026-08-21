@@ -16,6 +16,7 @@ The core user journey is:
 Deploy Revtern
   -> create owner account
   -> create app
+  -> optionally invite Viewer, Analyst, Editor, or Manager collaborators
   -> connect a data source
   -> review generated product catalog draft
   -> confirm product catalog and mappings
@@ -48,6 +49,9 @@ http://localhost:3000
 For production self-hosting, the user should put Revtern behind HTTPS through
 Caddy, Nginx, Traefik, Cloudflare Tunnel, Tailscale Funnel, or another reverse
 proxy.
+
+After setup, every account owns its own apps. App managers can invite another
+email without exposing other apps in the owner's personal workspace.
 
 ## 2. First-Run Setup
 

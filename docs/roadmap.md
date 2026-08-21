@@ -100,9 +100,9 @@ Only after the self-hosted product is useful.
 
 Scope:
 
-- Multi-workspace.
+- Organization administration across multiple personal workspaces.
 - Billing.
-- Team users.
-- Stronger audit logging.
-- SSO for paid plans.
+- SCIM provisioning and group-to-role mapping.
+- Multiple OIDC providers and organization login policy.
+- Audit-log retention and external export.
 - Managed webhook reliability.

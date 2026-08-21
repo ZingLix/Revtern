@@ -1,6 +1,8 @@
 import { ApiError, type CatalogConfirmation } from "@revtern/api-client";
 import type {
+  AppMemberRecord,
   AppRecord,
+  AppRoleRecord,
   DataSourceRecord,
   LogicalProductRecord,
   RawEventRecord,
@@ -50,10 +52,13 @@ import {
   ShieldCheck,
   SquareStack,
   TrendingUp,
+  Trash2,
+  UserPlus,
+  Users,
   X,
 } from "lucide-react";
-import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
-import { NavLink as RouterNavLink, Navigate, Route, Routes } from "react-router-dom";
+import { createContext, FormEvent, ReactNode, useContext, useEffect, useMemo, useState } from "react";
+import { NavLink as RouterNavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import {
   Bar,
   BarChart,
@@ -71,19 +76,21 @@ import { buildCatalogDraft, type CatalogDraftGroup } from "./lib/catalog";
 import { formatCompactMoney, formatDate, formatDateTime, formatMoney, formatNumber, formatPercent, last30Days, titleize } from "./lib/format";
 
 const navItems = [
-  { to: "/", label: "Overview", icon: LayoutDashboard },
-  { to: "/revenue", label: "Revenue", icon: LineChartIcon },
-  { to: "/transactions", label: "Transactions", icon: Receipt },
-  { to: "/subscriptions", label: "Subscriptions", icon: SquareStack },
-  { to: "/products", label: "Products", icon: Boxes },
-  { to: "/events", label: "Events", icon: Database },
-  { to: "/sources", label: "Sources", icon: RadioTower },
-  { to: "/reconciliation", label: "Reconciliation", icon: AlertTriangle },
-  { to: "/jobs", label: "Jobs", icon: ListChecks },
-  { to: "/settings", label: "Settings", icon: Settings },
+  { to: "/", label: "Overview", icon: LayoutDashboard, permission: "app.read" },
+  { to: "/revenue", label: "Revenue", icon: LineChartIcon, permission: "app.read" },
+  { to: "/transactions", label: "Transactions", icon: Receipt, permission: "ledger.read" },
+  { to: "/subscriptions", label: "Subscriptions", icon: SquareStack, permission: "ledger.read" },
+  { to: "/products", label: "Products", icon: Boxes, permission: "app.read" },
+  { to: "/events", label: "Events", icon: Database, permission: "events.sensitive.read" },
+  { to: "/sources", label: "Sources", icon: RadioTower, permission: "app.read" },
+  { to: "/reconciliation", label: "Reconciliation", icon: AlertTriangle, permission: "app.read" },
+  { to: "/jobs", label: "Jobs", icon: ListChecks, permission: "jobs.run" },
+  { to: "/settings", label: "Settings", icon: Settings, permission: null },
 ];
 
 export default function App() {
+  const location = useLocation();
+  const invitationToken = invitationTokenFromPath(location.pathname);
   const setup = useQuery({ queryKey: ["setup-status"], queryFn: () => api.setupStatus() });
   const me = useQuery({
     queryKey: ["me"],
@@ -96,7 +103,18 @@ export default function App() {
   if (setup.error) return <AuthFrame><ErrorBlock error={setup.error} /></AuthFrame>;
   if (setup.data?.needs_setup) return <SetupScreen />;
   if (me.isLoading) return <BootScreen />;
-  if (me.error) return <LoginScreen authMode={setup.data?.auth_mode ?? "single_user"} />;
+  if (invitationToken) {
+    return <InvitationScreen authenticated={Boolean(me.data)} token={invitationToken} />;
+  }
+  if (me.error) {
+    return (
+      <LoginScreen
+        authMode={setup.data?.auth_mode ?? "local"}
+        oidcName={setup.data?.oidc?.name}
+        registrationMode={setup.data?.registration_mode ?? "invite_only"}
+      />
+    );
+  }
   if (!me.data) return <BootScreen />;
   return <AppShell me={me.data} />;
 }
@@ -167,12 +185,28 @@ function SetupScreen() {
   );
 }
 
-function LoginScreen({ authMode }: { authMode: string }) {
+function LoginScreen({
+  authMode,
+  oidcName,
+  registrationMode,
+}: {
+  authMode: string;
+  oidcName?: string;
+  registrationMode: "closed" | "invite_only" | "open";
+}) {
   const queryClient = useQueryClient();
+  const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [displayName, setDisplayName] = useState("");
   const mutation = useMutation({
-    mutationFn: () => api.login({ email, password }),
+    mutationFn: async () => {
+      if (mode === "login") {
+        await api.login({ email, password });
+      } else {
+        await api.register({ email, password, display_name: displayName || undefined });
+      }
+    },
     onSuccess: async () => {
       await queryClient.invalidateQueries();
     },
@@ -187,8 +221,16 @@ function LoginScreen({ authMode }: { authMode: string }) {
           mutation.mutate();
         }}
       >
-        <h1>Sign in</h1>
+        <h1>{mode === "login" ? "Sign in" : "Create account"}</h1>
+        {registrationMode === "open" ? (
+          <Segmented value={mode} onChange={(value) => setMode(value as "login" | "register")} options={["login", "register"]} />
+        ) : null}
         {authMode === "reverse_proxy" ? <p className="muted">Reverse proxy mode is enabled; the trusted user header was not present.</p> : null}
+        {mode === "register" ? (
+          <Field label="Display name">
+            <Input fullWidth value={displayName} onChange={(event) => setDisplayName(event.target.value)} variant="secondary" />
+          </Field>
+        ) : null}
         <Field label="Email">
           <Input fullWidth value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoFocus required variant="secondary" />
         </Field>
@@ -198,15 +240,168 @@ function LoginScreen({ authMode }: { authMode: string }) {
         {mutation.error ? <ErrorBlock error={mutation.error} /> : null}
         <Button isDisabled={mutation.isPending} size="sm" type="submit" variant="primary">
           <Check size={16} />
-          Sign in
+          {mode === "login" ? "Sign in" : "Create account"}
         </Button>
+        {oidcName ? (
+          <Link className="auth-provider-link" href={api.oidcStartUrl({ returnTo: "/" })}>
+            Continue with {oidcName}
+          </Link>
+        ) : null}
+        {registrationMode === "invite_only" ? <p className="muted auth-note">New accounts require an app invitation.</p> : null}
       </form>
     </AuthFrame>
   );
 }
 
+function InvitationScreen({ authenticated, token }: { authenticated: boolean; token: string }) {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const setup = useQuery({ queryKey: ["setup-status"], queryFn: () => api.setupStatus() });
+  const invitation = useQuery({ queryKey: ["invitation", token], queryFn: () => api.invitation(token), retry: false });
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [password, setPassword] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const accept = useMutation({
+    mutationFn: () => api.acceptInvitation(token),
+    onSuccess: async (result) => {
+      localStorage.setItem("revtern_app_id", result.app_id);
+      await queryClient.invalidateQueries();
+      navigate("/", { replace: true });
+    },
+  });
+  const credentials = useMutation({
+    mutationFn: async () => {
+      const email = invitation.data?.invitation.email ?? "";
+      if (mode === "register") {
+        return api.register({ email, password, display_name: displayName || undefined, invite_token: token });
+      }
+      await api.login({ email, password });
+      return api.acceptInvitation(token);
+    },
+    onSuccess: async (result) => {
+      if ("app_id" in result) localStorage.setItem("revtern_app_id", result.app_id);
+      if ("accepted_app_id" in result && result.accepted_app_id) localStorage.setItem("revtern_app_id", result.accepted_app_id);
+      await queryClient.invalidateQueries();
+      navigate("/", { replace: true });
+    },
+  });
+  const preview = invitation.data?.invitation;
+  const registrationMode = setup.data?.registration_mode ?? "invite_only";
+
+  return (
+    <AuthFrame>
+      <div className="stack invitation-screen">
+        <div>
+          <span className="eyebrow">App invitation</span>
+          <h1>{preview ? `Join ${preview.app_name}` : "App invitation"}</h1>
+          {preview ? (
+            <p className="muted">
+              {preview.inviter_name ?? "An app manager"} invited {preview.email} with {titleize(preview.role)} access.
+            </p>
+          ) : null}
+        </div>
+        {invitation.isLoading ? <p className="muted">Checking invitation…</p> : null}
+        {invitation.error ? <ErrorBlock error={invitation.error} /> : null}
+        {preview && authenticated ? (
+          <>
+            {accept.error ? <ErrorBlock error={accept.error} /> : null}
+            <Button isDisabled={accept.isPending} onPress={() => accept.mutate()} size="sm" variant="primary">
+              <Check size={16} />
+              Accept invitation
+            </Button>
+          </>
+        ) : null}
+        {preview && !authenticated ? (
+          <form
+            className="stack"
+            onSubmit={(event) => {
+              event.preventDefault();
+              credentials.mutate();
+            }}
+          >
+            {registrationMode !== "closed" ? (
+              <Segmented value={mode} onChange={(value) => setMode(value as "login" | "register")} options={["login", "register"]} />
+            ) : null}
+            <Field label="Email">
+              <Input fullWidth value={preview.email} readOnly variant="secondary" />
+            </Field>
+            {mode === "register" ? (
+              <Field label="Display name">
+                <Input fullWidth value={displayName} onChange={(event) => setDisplayName(event.target.value)} variant="secondary" />
+              </Field>
+            ) : null}
+            <Field label="Password">
+              <Input fullWidth value={password} onChange={(event) => setPassword(event.target.value)} type="password" minLength={8} required variant="secondary" />
+            </Field>
+            {credentials.error ? <ErrorBlock error={credentials.error} /> : null}
+            <Button isDisabled={credentials.isPending} size="sm" type="submit" variant="primary">
+              <Check size={16} />
+              {mode === "register" ? "Create account and join" : "Sign in and join"}
+            </Button>
+            {setup.data?.oidc ? (
+              <Link
+                className="auth-provider-link"
+                href={api.oidcStartUrl({ inviteToken: token, returnTo: `/invitations/${token}` })}
+              >
+                Continue with {setup.data.oidc.name}
+              </Link>
+            ) : null}
+          </form>
+        ) : null}
+      </div>
+    </AuthFrame>
+  );
+}
+
+function invitationTokenFromPath(pathname: string) {
+  const match = pathname.match(/^\/invitations\/([^/]+)\/?$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+interface AppScopeValue {
+  apps: AppRecord[];
+  selectedApp?: AppRecord;
+  selectedAppId: string;
+  setSelectedAppId: (appId: string) => void;
+}
+
+const AppScopeContext = createContext<AppScopeValue | null>(null);
+
+function useAppScope() {
+  const value = useContext(AppScopeContext);
+  if (!value) throw new Error("App scope is unavailable");
+  return value;
+}
+
 function AppShell({ me }: { me: { user: { email: string; role: string }; workspace: { name: string } } }) {
   const queryClient = useQueryClient();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const appsQuery = useQuery({ queryKey: ["apps"], queryFn: () => api.apps() });
+  const apps = appsQuery.data?.apps ?? [];
+  const [selectedAppId, setSelectedAppIdState] = useState(() => localStorage.getItem("revtern_app_id") ?? "");
+  const selectedApp = apps.find((app) => app.id === selectedAppId);
+  useEffect(() => {
+    if (appsQuery.isSuccess && !apps.length && location.pathname !== "/settings") {
+      navigate("/settings", { replace: true });
+      return;
+    }
+    const acceptedAppId = new URLSearchParams(location.search).get("app_id");
+    if (acceptedAppId && apps.some((app) => app.id === acceptedAppId)) {
+      setSelectedAppIdState(acceptedAppId);
+      localStorage.setItem("revtern_app_id", acceptedAppId);
+      window.history.replaceState({}, "", location.pathname);
+      return;
+    }
+    if (apps.length && !selectedApp) {
+      setSelectedAppIdState(apps[0].id);
+      localStorage.setItem("revtern_app_id", apps[0].id);
+    }
+  }, [apps, appsQuery.isSuccess, location.pathname, location.search, navigate, selectedApp]);
+  const setSelectedAppId = (appId: string) => {
+    setSelectedAppIdState(appId);
+    localStorage.setItem("revtern_app_id", appId);
+  };
   const logout = useMutation({
     mutationFn: () => api.logout(),
     onSuccess: async () => {
@@ -215,6 +410,7 @@ function AppShell({ me }: { me: { user: { email: string; role: string }; workspa
   });
 
   return (
+    <AppScopeContext.Provider value={{ apps, selectedApp, selectedAppId, setSelectedAppId }}>
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand-row sidebar-brand">
@@ -224,8 +420,20 @@ function AppShell({ me }: { me: { user: { email: string; role: string }; workspa
             <span>{me.workspace.name}</span>
           </div>
         </div>
+        {apps.length ? (
+          <div className="sidebar-app-switcher">
+            <span>Current app</span>
+            <SelectControl
+              ariaLabel="Current app"
+              value={selectedAppId}
+              onChange={setSelectedAppId}
+              options={apps.map((app) => ({ value: app.id, label: app.name }))}
+            />
+            {selectedApp ? <small>{titleize(selectedApp.role)} access</small> : null}
+          </div>
+        ) : null}
         <nav className="nav-list">
-          {navItems.map((item) => {
+          {navItems.filter((item) => !item.permission || selectedApp?.permissions.includes(item.permission)).map((item) => {
             const Icon = item.icon;
             return (
               <RouterNavLink
@@ -264,6 +472,7 @@ function AppShell({ me }: { me: { user: { email: string; role: string }; workspa
         </Routes>
       </main>
     </div>
+    </AppScopeContext.Provider>
   );
 }
 
@@ -273,8 +482,8 @@ function OverviewPage() {
   const overview = useQuery({ queryKey: ["overview", filters], queryFn: () => api.overview(filters) });
   const series = useQuery({ queryKey: ["revenue-series", filters], queryFn: () => api.revenueTimeseries(filters) });
   const transactions = useQuery({ queryKey: ["transactions", "recent", filters], queryFn: () => api.transactions({ ...filters }), placeholderData: (previous) => previous });
-  const sources = useQuery({ queryKey: ["data-sources"], queryFn: () => api.dataSources() });
-  const sourceProducts = useQuery({ queryKey: ["source-products", "overview"], queryFn: () => api.sourceProducts() });
+  const sources = useQuery({ queryKey: ["data-sources", filters.app_id], queryFn: () => api.dataSources({ app_id: filters.app_id }) });
+  const sourceProducts = useQuery({ queryKey: ["source-products", "overview", filters.app_id], queryFn: () => api.sourceProducts({ app_id: filters.app_id }) });
   const seed = useMutation({
     mutationFn: () => api.seedDemo(),
     onSuccess: async () => {
@@ -681,21 +890,15 @@ function SubscriptionsPage() {
 
 function ProductsPage() {
   const queryClient = useQueryClient();
-  const apps = useQuery({ queryKey: ["apps"], queryFn: () => api.apps() });
-  const sourceProducts = useQuery({ queryKey: ["source-products"], queryFn: () => api.sourceProducts() });
-  const logicalProducts = useQuery({ queryKey: ["logical-products"], queryFn: () => api.logicalProducts() });
-  const firstAppId = apps.data?.apps[0]?.id ?? "";
-  const [selectedAppId, setSelectedAppId] = useState(firstAppId);
+  const { selectedApp, selectedAppId } = useAppScope();
+  const sourceProducts = useQuery({ queryKey: ["source-products", selectedAppId], queryFn: () => api.sourceProducts({ app_id: selectedAppId }), enabled: Boolean(selectedAppId) });
+  const logicalProducts = useQuery({ queryKey: ["logical-products", selectedAppId], queryFn: () => api.logicalProducts({ app_id: selectedAppId }), enabled: Boolean(selectedAppId) });
   const [drafts, setDrafts] = useState<CatalogDraftGroup[]>([]);
   const [ignored, setIgnored] = useState<Set<string>>(new Set());
   const unmapped = useMemo(
     () => (sourceProducts.data?.source_products ?? []).filter((product) => product.mapping_state === "unmapped"),
     [sourceProducts.data],
   );
-
-  useEffect(() => {
-    if (!selectedAppId && firstAppId) setSelectedAppId(firstAppId);
-  }, [firstAppId, selectedAppId]);
 
   useEffect(() => {
     setDrafts(buildCatalogDraft(unmapped));
@@ -740,18 +943,12 @@ function ProductsPage() {
       title="Products"
       actions={
         <Toolbar className="toolbar" aria-label="Product catalog actions">
-          <SelectControl
-            ariaLabel="Catalog app"
-            value={selectedAppId}
-            onChange={setSelectedAppId}
-            options={(apps.data?.apps ?? []).map((app) => ({ value: app.id, label: app.name }))}
-          />
           <Button onPress={() => setDrafts(buildCatalogDraft(unmapped))} size="sm" variant="secondary">
             <RefreshCw size={16} />
             Regenerate draft
           </Button>
           <Button
-            isDisabled={!selectedAppId || confirm.isPending || (!drafts.length && !ignored.size)}
+            isDisabled={!selectedAppId || !selectedApp?.permissions.includes("catalog.write") || confirm.isPending || (!drafts.length && !ignored.size)}
             onPress={() => confirm.mutate()}
             size="sm"
             variant="primary"
@@ -849,10 +1046,11 @@ function ProductsPage() {
 }
 
 function EventsPage() {
+  const { selectedAppId } = useAppScope();
   const [tab, setTab] = useState<"raw" | "normalized">("raw");
   const [q, setQ] = useState("");
-  const raw = useQuery({ queryKey: ["raw-events", q], queryFn: () => api.rawEvents({ q }), enabled: tab === "raw" });
-  const normalized = useQuery({ queryKey: ["normalized-events"], queryFn: () => api.normalizedEvents(), enabled: tab === "normalized" });
+  const raw = useQuery({ queryKey: ["raw-events", selectedAppId, q], queryFn: () => api.rawEvents({ app_id: selectedAppId, q }), enabled: tab === "raw" && Boolean(selectedAppId) });
+  const normalized = useQuery({ queryKey: ["normalized-events", selectedAppId], queryFn: () => api.normalizedEvents({ app_id: selectedAppId }), enabled: tab === "normalized" && Boolean(selectedAppId) });
   const [selected, setSelected] = useState<RawEventRecord | null>(null);
 
   return (
@@ -938,8 +1136,9 @@ function EventsPage() {
 
 function SourcesPage() {
   const queryClient = useQueryClient();
-  const apps = useQuery({ queryKey: ["apps"], queryFn: () => api.apps() });
-  const sources = useQuery({ queryKey: ["data-sources"], queryFn: () => api.dataSources() });
+  const { apps, selectedApp, selectedAppId } = useAppScope();
+  const writableApps = apps.filter((app) => app.permissions.includes("source.write"));
+  const sources = useQuery({ queryKey: ["data-sources", selectedAppId], queryFn: () => api.dataSources({ app_id: selectedAppId }), enabled: Boolean(selectedAppId) });
   const create = useMutation({
     mutationFn: (input: { source_type: string; name: string; app_id?: string | null; credentials?: Record<string, unknown> }) => api.createDataSource(input),
     onSuccess: async () => {
@@ -970,7 +1169,18 @@ function SourcesPage() {
     <Page title="Sources">
       <div className="two-column align-start">
         <Panel title="Add source">
-          <SourceForm apps={apps.data?.apps ?? []} onSubmit={(input) => create.mutate(input)} pending={create.isPending} error={create.error} />
+          {writableApps.length ? (
+            <SourceForm
+              allowCredentials={Boolean(selectedApp?.permissions.includes("source.credentials.write"))}
+              apps={writableApps}
+              initialAppId={selectedAppId}
+              onSubmit={(input) => create.mutate(input)}
+              pending={create.isPending}
+              error={create.error}
+            />
+          ) : (
+            <p className="muted">Your role can view source health but cannot add or change sources.</p>
+          )}
         </Panel>
         <Panel title="Connected sources">
           <div className="source-card-list">
@@ -978,11 +1188,11 @@ function SourcesPage() {
               <SourceCard
                 key={source.id}
                 source={source}
-                onTest={() => test.mutate(source.id)}
-                onConfigureCatchUp={supportsCatchUp(source.source_type)
+                onTest={selectedApp?.permissions.includes("source.write") ? () => test.mutate(source.id) : undefined}
+                onConfigureCatchUp={selectedApp?.permissions.includes("source.credentials.write") && supportsCatchUp(source.source_type)
                   ? (credentials) => updateCredentials.mutate({ id: source.id, credentials })
                   : undefined}
-                onCatchUp={supportsCatchUp(source.source_type) && source.has_credentials ? () => catchUp.mutate(source.id) : undefined}
+                onCatchUp={selectedApp?.permissions.includes("source.write") && supportsCatchUp(source.source_type) && source.has_credentials ? () => catchUp.mutate(source.id) : undefined}
                 configurePending={updateCredentials.isPending && updateCredentials.variables?.id === source.id}
                 configureError={updateCredentials.variables?.id === source.id ? updateCredentials.error : null}
               />
@@ -996,10 +1206,11 @@ function SourcesPage() {
 }
 
 function ReconciliationPage() {
-  const overview = useQuery({ queryKey: ["overview", "reconciliation"], queryFn: () => api.overview({}) });
-  const sourceProducts = useQuery({ queryKey: ["source-products"], queryFn: () => api.sourceProducts() });
-  const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => api.jobs() });
-  const rawFailed = useQuery({ queryKey: ["raw-events", "failed"], queryFn: () => api.rawEvents({ processing_status: "failed" }) });
+  const { selectedAppId } = useAppScope();
+  const overview = useQuery({ queryKey: ["overview", "reconciliation", selectedAppId], queryFn: () => api.overview({ app_id: selectedAppId }), enabled: Boolean(selectedAppId) });
+  const sourceProducts = useQuery({ queryKey: ["source-products", selectedAppId], queryFn: () => api.sourceProducts({ app_id: selectedAppId }), enabled: Boolean(selectedAppId) });
+  const jobs = useQuery({ queryKey: ["jobs", selectedAppId], queryFn: () => api.jobs({ app_id: selectedAppId }), enabled: Boolean(selectedAppId) });
+  const rawFailed = useQuery({ queryKey: ["raw-events", "failed", selectedAppId], queryFn: () => api.rawEvents({ app_id: selectedAppId, processing_status: "failed" }), enabled: Boolean(selectedAppId) });
   const issues = [
     ...(overview.data?.warnings ?? []).map((message) => ({ message, severity: "warning" })),
     ...((sourceProducts.data?.source_products ?? []).filter((product) => product.mapping_state === "unmapped").map((product) => ({
@@ -1039,7 +1250,8 @@ function ReconciliationPage() {
 
 function JobsPage() {
   const queryClient = useQueryClient();
-  const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => api.jobs(), refetchInterval: 10_000 });
+  const { selectedAppId } = useAppScope();
+  const jobs = useQuery({ queryKey: ["jobs", selectedAppId], queryFn: () => api.jobs({ app_id: selectedAppId }), enabled: Boolean(selectedAppId), refetchInterval: 10_000 });
   const retry = useMutation({
     mutationFn: (id: string) => api.retryJob(id),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
@@ -1083,56 +1295,241 @@ function JobsPage() {
 
 function SettingsPage() {
   const queryClient = useQueryClient();
-  const apps = useQuery({ queryKey: ["apps"], queryFn: () => api.apps() });
+  const { apps, selectedApp, selectedAppId, setSelectedAppId } = useAppScope();
+  const setup = useQuery({ queryKey: ["setup-status"], queryFn: () => api.setupStatus() });
+  const identities = useQuery({ queryKey: ["auth-identities"], queryFn: () => api.authIdentities() });
   const createApp = useMutation({
     mutationFn: (input: { name: string; apple_bundle_id?: string; google_package_name?: string; default_currency?: string }) => api.createApp(input),
+    onSuccess: async (result) => {
+      setSelectedAppId(result.app.id);
+      await queryClient.invalidateQueries({ queryKey: ["apps"] });
+    },
+  });
+  const updateApp = useMutation({
+    mutationFn: (input: { name: string; apple_bundle_id?: string; google_package_name?: string; default_currency?: string }) => api.updateApp(selectedAppId, input),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["apps"] }),
   });
   return (
     <Page title="Settings">
-      <div className="two-column align-start">
-        <Panel title="Apps">
+      <div className="settings-grid">
+        <Panel title="Your apps">
           <AppForm onSubmit={(input) => createApp.mutate(input)} pending={createApp.isPending} error={createApp.error} />
           <DataTable ariaLabel="Apps" compact>
             <Table.Header>
               <Table.Column isRowHeader>Name</Table.Column>
-              <Table.Column>Apple bundle</Table.Column>
-              <Table.Column>Google package</Table.Column>
-              <Table.Column>Currency</Table.Column>
+              <Table.Column>Access</Table.Column>
+              <Table.Column>Scope</Table.Column>
             </Table.Header>
             <Table.Body>
-              {(apps.data?.apps ?? []).map((app) => (
-                <Table.Row id={app.id} key={app.id}>
+              {apps.map((app) => (
+                <Table.Row className="click-row" id={app.id} key={app.id} onAction={() => setSelectedAppId(app.id)}>
                   <Table.Cell>{app.name}</Table.Cell>
-                  <Table.Cell className="mono-cell">{app.apple_bundle_id ?? "—"}</Table.Cell>
-                  <Table.Cell className="mono-cell">{app.google_package_name ?? "—"}</Table.Cell>
-                  <Table.Cell>{app.default_currency ?? "—"}</Table.Cell>
+                  <Table.Cell><StatusLabel value={app.role} /></Table.Cell>
+                  <Table.Cell>{app.id === selectedAppId ? "Current" : "Switch"}</Table.Cell>
                 </Table.Row>
               ))}
             </Table.Body>
           </DataTable>
         </Panel>
-        <Panel title="Local data">
-          <div className="settings-actions">
-            <Link href={`${API_BASE_URL}/api/export/transactions.csv`}>
-              <Database size={16} />
-              Export transactions CSV
-            </Link>
+        <Panel title={selectedApp ? `${selectedApp.name} details` : "App details"}>
+          {selectedApp?.permissions.includes("app.write") ? (
+            <AppEditForm app={selectedApp} error={updateApp.error} pending={updateApp.isPending} onSubmit={(input) => updateApp.mutate(input)} />
+          ) : selectedApp ? (
+            <div className="permission-summary">
+              <p className="muted">Your {titleize(selectedApp.role)} role has read-only app settings.</p>
+              <PermissionList permissions={selectedApp.permissions} />
+            </div>
+          ) : (
+            <EmptyState icon={<Boxes size={18} />} title="Create an app to continue" />
+          )}
+        </Panel>
+        {selectedApp?.permissions.includes("members.manage") ? <AppMembersPanel app={selectedApp} /> : null}
+        <Panel title="Sign-in methods">
+          <div className="identity-list">
+            <div className="identity-row">
+              <KeyRound size={17} />
+              <div><strong>Local password</strong><span>{identities.data?.has_local_password ? "Connected" : "Not configured"}</span></div>
+              <StatusLabel value={identities.data?.has_local_password ? "active" : "disabled"} />
+            </div>
+            {(identities.data?.identities ?? []).map((identity) => (
+              <div className="identity-row" key={identity.id}>
+                <ShieldCheck size={17} />
+                <div><strong>{identity.provider_name}</strong><span>{identity.email ?? "No email claim"}</span></div>
+                <StatusLabel value={identity.email_verified ? "verified" : "unverified"} />
+              </div>
+            ))}
           </div>
-          <p className="muted">Webhook secrets are stored as hashes. Raw payload access is limited to the owner session.</p>
+          {setup.data?.oidc && !identities.data?.identities.length ? (
+            <Link className="auth-provider-link" href={api.oidcStartUrl({ link: true, returnTo: "/settings" })}>
+              Link {setup.data.oidc.name}
+            </Link>
+          ) : null}
+          {identities.error ? <ErrorBlock error={identities.error} /> : null}
+        </Panel>
+        <Panel title="Data access">
+          <div className="settings-actions">
+            {selectedApp?.permissions.includes("export.run") ? <Link href={`${API_BASE_URL}/api/export/transactions.csv?app_id=${encodeURIComponent(selectedAppId)}`}>
+              <Database size={16} />
+              Export current app CSV
+            </Link> : <span className="muted">Export permission is not included in your role.</span>}
+          </div>
+          <p className="muted">Webhook secrets are stored as hashes. Raw payload and export access follow the selected app role.</p>
         </Panel>
       </div>
     </Page>
   );
 }
 
+function AppMembersPanel({ app }: { app: AppRecord }) {
+  const queryClient = useQueryClient();
+  const members = useQuery({ queryKey: ["app-members", app.id], queryFn: () => api.appMembers(app.id) });
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState("viewer");
+  const [createdInviteUrl, setCreatedInviteUrl] = useState<string | null>(null);
+  const invite = useMutation({
+    mutationFn: () => api.inviteAppMember(app.id, { email, role }),
+    onSuccess: async (result) => {
+      setCreatedInviteUrl(result.invitation.invite_url ?? null);
+      setEmail("");
+      await queryClient.invalidateQueries({ queryKey: ["app-members", app.id] });
+    },
+  });
+  const updateRole = useMutation({
+    mutationFn: ({ userId, nextRole }: { userId: string; nextRole: string }) => api.updateAppMember(app.id, userId, { role: nextRole }),
+    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["app-members", app.id] }),
+  });
+  const remove = useMutation({
+    mutationFn: (userId: string) => api.removeAppMember(app.id, userId),
+    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["app-members", app.id] }),
+  });
+  const revoke = useMutation({
+    mutationFn: (invitationId: string) => api.revokeAppInvitation(app.id, invitationId),
+    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["app-members", app.id] }),
+  });
+  const roles = members.data?.roles ?? [];
+
+  return (
+    <div className="settings-span">
+      <Panel title="People and access" actions={<StatusLabel value={`${members.data?.members.length ?? 0} members`} />}>
+        <form
+          className="invite-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setCreatedInviteUrl(null);
+            invite.mutate();
+          }}
+        >
+          <Field label="Email">
+            <Input fullWidth value={email} onChange={(event) => setEmail(event.target.value)} type="email" placeholder="teammate@example.com" required variant="secondary" />
+          </Field>
+          <Field label="Role">
+            <SelectControl ariaLabel="Invitation role" value={role} onChange={setRole} options={roles.map((item) => ({ value: item.key, label: item.name }))} />
+          </Field>
+          <Button isDisabled={invite.isPending || !email} size="sm" type="submit" variant="primary">
+            <UserPlus size={16} /> Invite
+          </Button>
+        </form>
+        {invite.error ? <ErrorBlock error={invite.error} /> : null}
+        {createdInviteUrl ? <InviteLink value={createdInviteUrl} /> : null}
+        <div className="role-guide">
+          {roles.map((item) => (
+            <div key={item.key}>
+              <strong>{item.name}</strong>
+              <span>{item.description}</span>
+            </div>
+          ))}
+        </div>
+        <DataTable ariaLabel="App members" compact>
+          <Table.Header>
+            <Table.Column isRowHeader>Person</Table.Column>
+            <Table.Column>Role</Table.Column>
+            <Table.Column>Granted through</Table.Column>
+            <Table.Column>Action</Table.Column>
+          </Table.Header>
+          <Table.Body>
+            {(members.data?.members ?? []).map((member) => (
+              <Table.Row id={member.user_id} key={member.user_id}>
+                <Table.Cell><MemberIdentity member={member} /></Table.Cell>
+                <Table.Cell>
+                  {member.access_origin === "membership" ? (
+                    <MemberRoleSelect member={member} roles={roles} onChange={(nextRole) => updateRole.mutate({ userId: member.user_id, nextRole })} />
+                  ) : <StatusLabel value={member.role} />}
+                </Table.Cell>
+                <Table.Cell>{titleize(member.access_origin)}</Table.Cell>
+                <Table.Cell>
+                  {member.access_origin === "membership" ? (
+                    <Button aria-label={`Remove ${member.email}`} isIconOnly onPress={() => remove.mutate(member.user_id)} size="sm" variant="ghost"><Trash2 size={15} /></Button>
+                  ) : null}
+                </Table.Cell>
+              </Table.Row>
+            ))}
+          </Table.Body>
+        </DataTable>
+        {(members.data?.invitations ?? []).length ? (
+          <div className="pending-invitations">
+            <h3>Pending invitations</h3>
+            {members.data?.invitations.map((item) => (
+              <div className="pending-invitation" key={item.id}>
+                <div><strong>{item.email}</strong><span>{titleize(item.role)} · expires {formatDateTime(item.expires_at)}</span></div>
+                <Button aria-label={`Revoke invitation for ${item.email}`} isIconOnly onPress={() => revoke.mutate(item.id)} size="sm" variant="ghost"><X size={15} /></Button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {members.error ? <ErrorBlock error={members.error} /> : null}
+        {updateRole.error || remove.error || revoke.error ? <ErrorBlock error={updateRole.error ?? remove.error ?? revoke.error} /> : null}
+      </Panel>
+    </div>
+  );
+}
+
+function MemberIdentity({ member }: { member: AppMemberRecord }) {
+  return <div className="member-identity"><strong>{member.display_name ?? member.email}</strong><span>{member.email}</span></div>;
+}
+
+function MemberRoleSelect({ member, roles, onChange }: { member: AppMemberRecord; roles: AppRoleRecord[]; onChange: (role: string) => void }) {
+  return <SelectControl ariaLabel={`Role for ${member.email}`} value={member.role} onChange={onChange} options={roles.map((item) => ({ value: item.key, label: item.name }))} />;
+}
+
+function InviteLink({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <Alert status="success">
+      <Alert.Indicator />
+      <Alert.Content>
+        <Alert.Title>Invitation created</Alert.Title>
+        <Alert.Description>This link is shown once. Copy it before leaving this page.</Alert.Description>
+        <code className="invite-url">{value}</code>
+      </Alert.Content>
+      <Button
+        aria-label="Copy invitation link"
+        isIconOnly
+        onPress={async () => {
+          await navigator.clipboard.writeText(value);
+          setCopied(true);
+        }}
+        size="sm"
+        variant="secondary"
+      >{copied ? <Check size={16} /> : <Copy size={16} />}</Button>
+    </Alert>
+  );
+}
+
+function PermissionList({ permissions }: { permissions: string[] }) {
+  return <div className="permission-list">{permissions.map((permission) => <Chip key={permission} size="sm" variant="soft">{permission}</Chip>)}</div>;
+}
+
 function SourceForm({
+  allowCredentials,
   apps,
+  initialAppId,
   pending,
   error,
   onSubmit,
 }: {
+  allowCredentials: boolean;
   apps: AppRecord[];
+  initialAppId?: string;
   pending: boolean;
   error: unknown;
   onSubmit: (input: { source_type: string; name: string; app_id?: string | null; credentials?: Record<string, unknown> }) => void;
@@ -1145,14 +1542,18 @@ function SourceForm({
   const [parseError, setParseError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!appId && apps[0]) setAppId(apps[0].id);
-  }, [appId, apps]);
+    if (initialAppId && apps.some((app) => app.id === initialAppId)) {
+      setAppId(initialAppId);
+    } else if (!appId && apps[0]) {
+      setAppId(apps[0].id);
+    }
+  }, [appId, apps, initialAppId]);
 
   function submit(event: FormEvent) {
     event.preventDefault();
     setParseError(null);
     let credentials: Record<string, unknown> = {};
-    if (supportsCatchUp(sourceType) && catchUpText.trim()) {
+    if (allowCredentials && supportsCatchUp(sourceType) && catchUpText.trim()) {
       try {
         const parsed = JSON.parse(catchUpText) as unknown;
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -1165,7 +1566,7 @@ function SourceForm({
         return;
       }
     }
-    if (secret) credentials.webhook_secret = secret;
+    if (allowCredentials && secret) credentials.webhook_secret = secret;
     const payload = Object.keys(credentials).length ? credentials : undefined;
     onSubmit({ source_type: sourceType, name, app_id: appId || null, credentials: payload });
   }
@@ -1201,15 +1602,14 @@ function SourceForm({
           value={appId}
           onChange={setAppId}
           options={[
-            { value: "", label: "No app" },
             ...apps.map((app) => ({ value: app.id, label: app.name })),
           ]}
         />
       </Field>
-      <Field label="Webhook secret">
+      {allowCredentials ? <Field label="Webhook secret">
         <Input fullWidth value={secret} onChange={(event) => setSecret(event.target.value)} placeholder="Optional shared secret" variant="secondary" />
-      </Field>
-      {supportsCatchUp(sourceType) ? (
+      </Field> : null}
+      {allowCredentials && supportsCatchUp(sourceType) ? (
         <Field label="Source credentials and verification JSON">
           <TextArea
             fullWidth
@@ -1223,7 +1623,7 @@ function SourceForm({
       ) : null}
       {parseError ? <p className="form-error">{parseError}</p> : null}
       {error ? <ErrorBlock error={error} /> : null}
-      <Button isDisabled={pending || !name} size="sm" type="submit" variant="primary">
+      <Button isDisabled={pending || !name || !appId} size="sm" type="submit" variant="primary">
         <Plus size={16} />
         Add source
       </Button>
@@ -1240,7 +1640,7 @@ function SourceCard({
   configureError,
 }: {
   source: DataSourceRecord;
-  onTest: () => void;
+  onTest?: () => void;
   onCatchUp?: () => void;
   onConfigureCatchUp?: (credentials: Record<string, unknown>) => void;
   configurePending?: boolean;
@@ -1314,10 +1714,10 @@ function SourceCard({
           ))}
         </ul>
         <div className="card-actions">
-          <Button onPress={onTest} size="sm" variant="secondary">
+          {onTest ? <Button onPress={onTest} size="sm" variant="secondary">
             <RefreshCw size={16} />
             Test
-          </Button>
+          </Button> : null}
           {onConfigureCatchUp ? (
             <Button
               onPress={() => {
@@ -1402,6 +1802,51 @@ function AppForm({
         Add
       </Button>
       {error ? <ErrorBlock error={error} /> : null}
+    </form>
+  );
+}
+
+function AppEditForm({
+  app,
+  pending,
+  error,
+  onSubmit,
+}: {
+  app: AppRecord;
+  pending: boolean;
+  error: unknown;
+  onSubmit: (input: { name: string; apple_bundle_id?: string; google_package_name?: string; default_currency?: string }) => void;
+}) {
+  const [name, setName] = useState(app.name);
+  const [appleBundleId, setAppleBundleId] = useState(app.apple_bundle_id ?? "");
+  const [googlePackageName, setGooglePackageName] = useState(app.google_package_name ?? "");
+  const [defaultCurrency, setDefaultCurrency] = useState(app.default_currency ?? "USD");
+  useEffect(() => {
+    setName(app.name);
+    setAppleBundleId(app.apple_bundle_id ?? "");
+    setGooglePackageName(app.google_package_name ?? "");
+    setDefaultCurrency(app.default_currency ?? "USD");
+  }, [app]);
+  return (
+    <form
+      className="stack"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSubmit({
+          name,
+          apple_bundle_id: appleBundleId || undefined,
+          google_package_name: googlePackageName || undefined,
+          default_currency: defaultCurrency || undefined,
+        });
+      }}
+    >
+      <Field label="Name"><Input fullWidth value={name} onChange={(event) => setName(event.target.value)} required variant="secondary" /></Field>
+      <Field label="Apple bundle ID"><Input fullWidth value={appleBundleId} onChange={(event) => setAppleBundleId(event.target.value)} variant="secondary" /></Field>
+      <Field label="Google package"><Input fullWidth value={googlePackageName} onChange={(event) => setGooglePackageName(event.target.value)} variant="secondary" /></Field>
+      <Field label="Default currency"><Input fullWidth value={defaultCurrency} onChange={(event) => setDefaultCurrency(event.target.value.toUpperCase())} variant="secondary" /></Field>
+      <PermissionList permissions={app.permissions} />
+      {error ? <ErrorBlock error={error} /> : null}
+      <Button isDisabled={pending || !name} size="sm" type="submit" variant="primary"><Check size={16} />Save changes</Button>
     </form>
   );
 }
@@ -1584,21 +2029,11 @@ function FilterBar({
   compact?: boolean;
   onChange: (next: Record<string, string>) => void;
 }) {
-  const apps = useQuery({ queryKey: ["apps"], queryFn: () => api.apps() });
-  const products = useQuery({ queryKey: ["logical-products"], queryFn: () => api.logicalProducts() });
+  const products = useQuery({ queryKey: ["logical-products", filters.app_id], queryFn: () => api.logicalProducts({ app_id: filters.app_id }) });
   return (
     <div className={compact ? "filter-bar compact-filter" : "filter-bar"}>
       <Input aria-label="From date" className="date-input" type="date" value={filters.from} onChange={(event) => onChange({ ...filters, from: event.target.value })} variant="secondary" />
       <Input aria-label="To date" className="date-input" type="date" value={filters.to} onChange={(event) => onChange({ ...filters, to: event.target.value })} variant="secondary" />
-      <SelectControl
-        ariaLabel="Dashboard app"
-        value={filters.app_id}
-        onChange={(app_id) => onChange({ ...filters, app_id })}
-        options={[
-          { value: "all", label: "All apps" },
-          ...(apps.data?.apps ?? []).map((app) => ({ value: app.id, label: app.name })),
-        ]}
-      />
       <SelectControl
         ariaLabel="Dashboard platform"
         value={filters.platform}
@@ -1625,14 +2060,19 @@ function FilterBar({
 }
 
 function useDashboardFilters() {
+  const { selectedAppId } = useAppScope();
   const range = useMemo(last30Days, []);
-  return useState<Record<string, string>>({
+  const [filters, setFilters] = useState<Record<string, string>>({
     ...range,
-    app_id: "all",
+    app_id: selectedAppId,
     platform: "all",
     logical_product_id: "all",
     currency: "USD",
   });
+  useEffect(() => {
+    setFilters((current) => current.app_id === selectedAppId ? current : { ...current, app_id: selectedAppId });
+  }, [selectedAppId]);
+  return [filters, setFilters] as const;
 }
 
 function Segmented({ value, options, onChange }: { value: string; options: string[]; onChange: (value: string) => void }) {

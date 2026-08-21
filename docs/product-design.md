@@ -257,12 +257,13 @@ label it as estimated.
 1. Developer starts Revtern through Docker Compose.
 2. Developer creates the first owner account.
 3. Developer creates an app in Revtern.
-4. Developer connects RevenueCat webhook or App Store/Google source.
-5. Revtern receives raw purchase events.
-6. Revtern normalizes events and updates rollups.
-7. Developer opens the dashboard and sees revenue, subscriptions, refunds, and
+4. Developer can share that app with a role-specific invitation.
+5. Developer connects RevenueCat webhook or App Store/Google source.
+6. Revtern receives raw purchase events.
+7. Revtern normalizes events and updates rollups.
+8. Developer opens the dashboard and sees revenue, subscriptions, refunds, and
    raw event details.
-8. Developer can inspect how a metric was calculated.
+9. Developer can inspect how a metric was calculated.
 
 ## Differentiation
 

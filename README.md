@@ -22,6 +22,7 @@ Core principles:
 - Raw events are retained and traceable.
 - Metrics must explain their source and calculation.
 - No required client SDK for the first version.
+- Multi-user app ownership and explicit per-app sharing.
 
 ## Implemented Stack
 
@@ -50,8 +51,8 @@ Core principles:
 
 The first useful version should support:
 
-- Single self-hosted workspace.
-- Minimal owner login.
+- Local multi-user accounts and OIDC login.
+- Per-user apps with Viewer, Analyst, Editor, and Manager sharing roles.
 - App Store webhook ingestion.
 - Google Play RTDN webhook ingestion.
 - Missed-webhook catch-up for provider notification history/backlog.
@@ -83,7 +84,7 @@ The first useful version should support:
 
 - Replacing RevenueCat, Adapty, Apphud, or Qonversion as purchase SDKs.
 - Managing end-user access or entitlements.
-- Full enterprise RBAC in the first release.
+- SCIM provisioning and organization policy management.
 - Data warehouse scale before the product model is proven.
 
 ## Running Locally

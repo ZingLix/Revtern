@@ -9,6 +9,7 @@
 - Idempotent ingestion.
 - Clear separation between ingestion, normalization, state building, and
   analytics.
+- App-level isolation for every user-facing query and background projection.
 - Good enough for small and medium app businesses before adding analytical
   infrastructure.
 
@@ -237,7 +238,9 @@ Configuration:
 - `DATABASE_URL`
 - `REVTERN_BASE_URL`
 - `REVTERN_AUTH_MODE`
+- `REVTERN_REGISTRATION_MODE`
 - `REVTERN_SECRET_KEY`
+- optional `REVTERN_OIDC_*` provider settings
 - source webhook secrets
 
 ## Observability
@@ -257,7 +260,10 @@ For self-hosting, observability should be built into the app:
 - Require HTTPS in production deployment docs.
 - Verify webhook signatures.
 - Redact secrets from logs.
-- Keep raw payload access limited to owner/admin users.
+- Gate every app resource through effective app capabilities; workspace IDs
+  alone are not authorization checks.
+- Keep raw payload access limited to Analyst, Editor, Manager, and owner/admin
+  roles.
 - Provide a no-telemetry default.
 
 ## Scale Plan

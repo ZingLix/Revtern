@@ -57,7 +57,7 @@ impl FromRequestParts<AppState> for CurrentUser {
         let mode = state.config.auth_mode.clone();
         async move {
             match mode {
-                AuthMode::SingleUser => current_from_session(&pool, &headers).await,
+                AuthMode::Local => current_from_session(&pool, &headers).await,
                 AuthMode::ReverseProxy => current_from_reverse_proxy(&pool, &headers).await,
                 AuthMode::Disabled => current_disabled(&pool).await,
             }
@@ -70,12 +70,16 @@ impl FromRequestParts<AppState> for CsrfGuard {
 
     fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        state: &AppState,
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         let method = parts.method.clone();
         let headers = parts.headers.clone();
+        let mode = state.config.auth_mode.clone();
         async move {
-            if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+            if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS)
+                || mode != AuthMode::Local
+                || bearer_token(&headers).is_some()
+            {
                 return Ok(Self);
             }
             let jar = CookieJar::from_headers(&headers);
@@ -118,18 +122,33 @@ pub async fn create_session(
     user_id: &str,
     jar: CookieJar,
 ) -> Result<CookieJar, ApiError> {
+    create_session_with_identity(pool, config, user_id, None, "local", jar).await
+}
+
+pub async fn create_session_with_identity(
+    pool: &sqlx::PgPool,
+    config: &Arc<Config>,
+    user_id: &str,
+    auth_identity_id: Option<&str>,
+    auth_method: &str,
+    jar: CookieJar,
+) -> Result<CookieJar, ApiError> {
     let session_id = new_id("ses");
     let token = random_token();
     let csrf = random_token();
     let session_hash = sha256_hex(token.as_bytes());
     let expires_at = OffsetDateTime::now_utc() + Duration::days(30);
+    let idle_expires_at = OffsetDateTime::now_utc() + Duration::hours(12);
     sqlx::query(
-        "insert into sessions (id, user_id, session_hash, expires_at, created_at, last_seen_at) values ($1, $2, $3, $4, now(), now())",
+        "insert into sessions (id, user_id, session_hash, expires_at, idle_expires_at, auth_identity_id, auth_method, created_at, last_seen_at) values ($1, $2, $3, $4, $5, $6, $7, now(), now())",
     )
     .bind(session_id)
     .bind(user_id)
     .bind(session_hash)
     .bind(expires_at)
+    .bind(idle_expires_at)
+    .bind(auth_identity_id)
+    .bind(auth_method)
     .execute(pool)
     .await?;
 
@@ -155,13 +174,15 @@ pub async fn create_bearer_session(pool: &sqlx::PgPool, user_id: &str) -> Result
     let token = random_token();
     let session_hash = sha256_hex(token.as_bytes());
     let expires_at = OffsetDateTime::now_utc() + Duration::days(30);
+    let idle_expires_at = OffsetDateTime::now_utc() + Duration::days(30);
     sqlx::query(
-        "insert into sessions (id, user_id, session_hash, expires_at, created_at, last_seen_at) values ($1, $2, $3, $4, now(), now())",
+        "insert into sessions (id, user_id, session_hash, expires_at, idle_expires_at, auth_method, created_at, last_seen_at) values ($1, $2, $3, $4, $5, 'local_mobile', now(), now())",
     )
     .bind(session_id)
     .bind(user_id)
     .bind(session_hash)
     .bind(expires_at)
+    .bind(idle_expires_at)
     .execute(pool)
     .await?;
     Ok(token)
@@ -213,11 +234,15 @@ async fn current_from_session(
         r#"
         select u.id as user_id, u.email, wu.role, w.id as workspace_id, w.name as workspace_name
         from sessions s
-        join users u on u.id = s.user_id
-        join workspace_users wu on wu.user_id = u.id
+        join users u on u.id = s.user_id and u.status = 'active'
+        join workspace_users wu on wu.user_id = u.id and wu.status = 'active'
         join workspaces w on w.id = wu.workspace_id
-        where s.session_hash = $1 and s.expires_at > now()
-        order by w.created_at asc
+        where s.session_hash = $1
+          and s.expires_at > now()
+          and coalesce(s.idle_expires_at, s.expires_at) > now()
+          and s.revoked_at is null
+        order by case wu.role when 'owner' then 0 when 'admin' then 1 else 2 end,
+                 w.created_at asc
         limit 1
         "#,
     )
@@ -226,7 +251,9 @@ async fn current_from_session(
     .await?;
     let row = row.ok_or_else(|| ApiError::Unauthorized("session expired".to_string()))?;
     let user_id: String = row.try_get("user_id")?;
-    sqlx::query("update sessions set last_seen_at = now() where session_hash = $1")
+    sqlx::query(
+        "update sessions set last_seen_at = now(), idle_expires_at = least(expires_at, now() + interval '12 hours') where session_hash = $1",
+    )
         .bind(sha256_hex(token.as_bytes()))
         .execute(pool)
         .await?;
@@ -263,18 +290,21 @@ async fn current_from_reverse_proxy(
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::Unauthorized("reverse proxy user header missing".to_string()))?;
+        .ok_or_else(|| ApiError::Unauthorized("reverse proxy user header missing".to_string()))?
+        .to_ascii_lowercase();
     let existing = sqlx::query(
         r#"
         select u.id as user_id, u.email, wu.role, w.id as workspace_id, w.name as workspace_name
         from users u
         join workspace_users wu on wu.user_id = u.id
         join workspaces w on w.id = wu.workspace_id
-        where u.email = $1
+        where u.email = $1 and u.status = 'active' and wu.status = 'active'
+        order by case wu.role when 'owner' then 0 when 'admin' then 1 else 2 end,
+                 w.created_at asc
         limit 1
         "#,
     )
-    .bind(email)
+    .bind(&email)
     .fetch_optional(pool)
     .await?;
     if let Some(row) = existing {
@@ -291,29 +321,36 @@ async fn current_from_reverse_proxy(
         });
     }
 
-    let workspace_id = ensure_workspace(pool).await?;
+    let workspace_id = new_id("wsp");
     let user_id = new_id("usr");
-    sqlx::query("insert into users (id, email, password_hash, role, created_at) values ($1, $2, 'reverse_proxy', 'owner', now())")
+    let mut tx = pool.begin().await?;
+    sqlx::query("insert into users (id, email, password_hash, display_name, role, status, created_at, updated_at) values ($1, $2, null, $2, 'owner', 'active', now(), now())")
         .bind(&user_id)
-        .bind(email)
-        .execute(pool)
+        .bind(&email)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("insert into workspaces (id, name, created_at) values ($1, $2, now())")
+        .bind(&workspace_id)
+        .bind(format!("{email}'s Apps"))
+        .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "insert into workspace_users (workspace_id, user_id, role) values ($1, $2, 'owner')",
+        "insert into workspace_users (workspace_id, user_id, role, status, created_at, updated_at) values ($1, $2, 'owner', 'active', now(), now())",
     )
     .bind(&workspace_id)
     .bind(&user_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(CurrentUser {
         user: UserSummary {
             id: user_id,
-            email: email.to_string(),
+            email: email.clone(),
             role: "owner".to_string(),
         },
         workspace: WorkspaceSummary {
             id: workspace_id,
-            name: "Revtern".to_string(),
+            name: format!("{email}'s Apps"),
         },
     })
 }
@@ -386,7 +423,7 @@ async fn ensure_workspace(pool: &sqlx::PgPool) -> Result<String, ApiError> {
     Ok(id)
 }
 
-fn random_token() -> String {
+pub fn random_token() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)

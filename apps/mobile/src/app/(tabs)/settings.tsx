@@ -2,7 +2,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'expo-router';
 import { StyleSheet, View } from 'react-native';
 
-import { NativeButton } from '@/components/native-controls';
+import { NativeButton, NativePicker, NativePickerItem } from '@/components/native-controls';
 import { Divider, Screen, Section } from '@/components/screen';
 import { ErrorState, LoadingState } from '@/components/states';
 import { ThemedText } from '@/components/themed-text';
@@ -13,11 +13,11 @@ import { useApi, useAuth } from '@/providers/auth';
 
 export default function SettingsScreen() {
   const api = useApi();
-  const { profile, serverUrl, disconnect } = useAuth();
+  const { apps, profile, selectedAppId, selectApp, serverUrl, disconnect } = useAuth();
   const router = useRouter();
   const queryClient = useQueryClient();
   const theme = useTheme();
-  const sources = useQuery({ queryKey: ['data-sources'], queryFn: () => api.dataSources() });
+  const sources = useQuery({ queryKey: ['data-sources', selectedAppId], queryFn: () => api.dataSources({ app_id: selectedAppId ?? undefined }) });
 
   async function signOut() {
     await disconnect();
@@ -40,6 +40,14 @@ export default function SettingsScreen() {
           <InfoRow label="Server" value={serverUrl ?? '—'} />
         </View>
       </Section>
+
+      {selectedAppId ? (
+        <Section title="Current app">
+          <NativePicker value={selectedAppId} onChange={(appId) => void selectApp(appId)}>
+            {apps.map((app) => <NativePickerItem key={app.id} label={`${app.name} · ${formatStatus(app.role)}`} value={app.id} />)}
+          </NativePicker>
+        </Section>
+      ) : null}
 
       <Section title="Source health">
         {sources.isLoading ? <LoadingState label="Checking sources" /> : null}

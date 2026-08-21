@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 
 struct ProjectionContext<'a> {
     workspace_id: &'a str,
-    app_id: Option<&'a str>,
+    app_id: &'a str,
     source_product_id: Option<&'a str>,
     logical_product_id: Option<&'a str>,
     source_type: &'a str,
@@ -18,12 +18,19 @@ pub async fn enqueue_normalization(pool: &PgPool, raw_event_id: &str) -> Result<
     let id = new_id("job");
     sqlx::query(
         r#"
-        insert into jobs (id, queue, job_type, payload, status, run_after, attempts, max_attempts, created_at)
-        values ($1, 'default', 'normalize_raw_event', $2, 'queued', now(), 0, 5, now())
+        insert into jobs (
+          id, workspace_id, app_id, queue, job_type, payload, status,
+          run_after, attempts, max_attempts, created_at
+        )
+        select $1, re.workspace_id, re.app_id, 'default', 'normalize_raw_event', $2,
+               'queued', now(), 0, 5, now()
+        from raw_events re
+        where re.id = $3
         "#,
     )
     .bind(&id)
     .bind(json!({ "raw_event_id": raw_event_id }))
+    .bind(raw_event_id)
     .execute(pool)
     .await?;
     Ok(id)
@@ -133,19 +140,19 @@ pub async fn process_raw_event(pool: &PgPool, raw_event_id: &str) -> Result<()> 
     let fallback_event_id: String = raw.try_get("source_event_id")?;
     let app_hint: Option<String> = raw.try_get("source_app_id_hint")?;
     let extracted = extract_event(&source_type, &payload, &fallback_event_id);
-    let app_id = resolve_app_id(pool, &workspace_id, app_hint, &extracted).await?;
+    let app_id = resolve_app_id(app_hint)?;
     let source_product_id = upsert_source_product(
         pool,
         &workspace_id,
         &data_source_id,
-        app_id.as_deref(),
+        &app_id,
         &source_type,
         &extracted,
         &payload,
     )
     .await?;
     let logical_product_id = if let Some(source_product_id) = source_product_id.as_deref() {
-        active_logical_product(pool, &workspace_id, source_product_id).await?
+        active_logical_product(pool, &app_id, source_product_id).await?
     } else {
         None
     };
@@ -153,7 +160,7 @@ pub async fn process_raw_event(pool: &PgPool, raw_event_id: &str) -> Result<()> 
     if let Some(event_type) = extracted.normalized_event_type.as_deref() {
         let projection = ProjectionContext {
             workspace_id: &workspace_id,
-            app_id: app_id.as_deref(),
+            app_id: &app_id,
             source_product_id: source_product_id.as_deref(),
             logical_product_id: logical_product_id.as_deref(),
             source_type: &source_type,
@@ -169,7 +176,7 @@ pub async fn process_raw_event(pool: &PgPool, raw_event_id: &str) -> Result<()> 
             update_daily_metric(
                 pool,
                 &workspace_id,
-                app_id.as_deref(),
+                &app_id,
                 logical_product_id.as_deref(),
                 &source_type,
                 event_type,
@@ -210,49 +217,15 @@ pub async fn process_raw_event(pool: &PgPool, raw_event_id: &str) -> Result<()> 
     Ok(())
 }
 
-async fn resolve_app_id(
-    pool: &PgPool,
-    workspace_id: &str,
-    app_hint: Option<String>,
-    extracted: &ExtractedEvent,
-) -> Result<Option<String>> {
-    if app_hint.is_some() {
-        return Ok(app_hint);
-    }
-
-    if let Some(source_app_id) = extracted.source_app_id.as_deref()
-        && let Some(row) = sqlx::query(
-            r#"
-            select id from apps
-            where workspace_id = $1
-              and ($2 = apple_bundle_id or $2 = google_package_name or $2 = platform_bundle_id)
-            limit 1
-            "#,
-        )
-        .bind(workspace_id)
-        .bind(source_app_id)
-        .fetch_optional(pool)
-        .await?
-    {
-        let id: String = row.try_get("id")?;
-        return Ok(Some(id));
-    }
-
-    let row =
-        sqlx::query("select id from apps where workspace_id = $1 order by created_at asc limit 1")
-            .bind(workspace_id)
-            .fetch_optional(pool)
-            .await?;
-    row.map(|row| row.try_get("id"))
-        .transpose()
-        .map_err(Into::into)
+fn resolve_app_id(app_hint: Option<String>) -> Result<String> {
+    app_hint.context("data source is not assigned to an app")
 }
 
 async fn upsert_source_product(
     pool: &PgPool,
     workspace_id: &str,
     data_source_id: &str,
-    app_id: Option<&str>,
+    app_id: &str,
     source_type: &str,
     extracted: &ExtractedEvent,
     payload: &Value,
@@ -310,19 +283,19 @@ async fn upsert_source_product(
 
 async fn active_logical_product(
     pool: &PgPool,
-    workspace_id: &str,
+    app_id: &str,
     source_product_id: &str,
 ) -> Result<Option<String>> {
     let row = sqlx::query(
         r#"
         select logical_product_id
         from product_mappings
-        where workspace_id = $1 and source_product_id = $2 and active = true
+        where app_id = $1 and source_product_id = $2 and active = true
         order by created_at desc
         limit 1
         "#,
     )
-    .bind(workspace_id)
+    .bind(app_id)
     .bind(source_product_id)
     .fetch_optional(pool)
     .await?;
@@ -468,7 +441,7 @@ async fn project_transaction(
           $12, $13, $14, $15, $16, null, $20,
           $17, $18, $19, $19, now()
         )
-        on conflict (workspace_id, source_type, transaction_key)
+        on conflict (app_id, source_type, transaction_key)
         do update set
           environment = excluded.environment,
           purchase_time = least(transactions.purchase_time, excluded.purchase_time),
@@ -518,6 +491,7 @@ async fn project_transaction(
         upsert_customer(
             pool,
             workspace_id,
+            app_id,
             customer_key,
             source_type,
             extracted.occurred_at,
@@ -528,14 +502,14 @@ async fn project_transaction(
             update transactions
             set customer_id = (
               select id from customers
-              where workspace_id = $1
+              where app_id = $1
                 and coalesce(app_user_id, revenuecat_app_user_id, google_obfuscated_account_id, apple_app_account_token) = $2
               limit 1
             )
             where id = $3
             "#,
         )
-        .bind(*workspace_id)
+        .bind(*app_id)
         .bind(customer_key)
         .bind(&transaction_id)
         .execute(pool)
@@ -606,7 +580,7 @@ async fn project_subscription(
           $12, $13, $14, $15, $16,
           $17, $18, $19, $20, now()
         )
-        on conflict (workspace_id, subscription_key)
+        on conflict (app_id, subscription_key)
         do update set
           environment = excluded.environment,
           status = case when excluded.status_updated_at >= subscriptions.status_updated_at then excluded.status else subscriptions.status end,
@@ -652,6 +626,7 @@ async fn project_subscription(
         upsert_customer(
             pool,
             workspace_id,
+            app_id,
             customer_key,
             source_type,
             extracted.occurred_at,
@@ -662,13 +637,13 @@ async fn project_subscription(
             update subscriptions
             set customer_id = (
               select id from customers
-              where workspace_id = $1 and customer_identity_key = $2
+              where app_id = $1 and customer_identity_key = $2
               limit 1
             )
-            where workspace_id = $1 and subscription_key = $3
+            where app_id = $1 and subscription_key = $3
             "#,
         )
-        .bind(*workspace_id)
+        .bind(*app_id)
         .bind(customer_key)
         .bind(&subscription_key)
         .execute(pool)
@@ -680,7 +655,7 @@ async fn project_subscription(
 async fn update_daily_metric(
     pool: &PgPool,
     workspace_id: &str,
-    app_id: Option<&str>,
+    app_id: &str,
     logical_product_id: Option<&str>,
     source_type: &str,
     event_type: &str,
@@ -771,6 +746,7 @@ async fn update_daily_metric(
 async fn upsert_customer(
     pool: &PgPool,
     workspace_id: &str,
+    app_id: &str,
     customer_key: &str,
     source_type: &str,
     occurred_at: OffsetDateTime,
@@ -784,16 +760,17 @@ async fn upsert_customer(
     sqlx::query(
         r#"
         insert into customers (
-          id, workspace_id, app_user_id, apple_app_account_token, google_obfuscated_account_id,
+          id, workspace_id, app_id, app_user_id, apple_app_account_token, google_obfuscated_account_id,
           revenuecat_app_user_id, first_seen_at, last_seen_at
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $7)
-        on conflict (workspace_id, customer_identity_key)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+        on conflict (app_id, customer_identity_key)
         do update set last_seen_at = excluded.last_seen_at
         "#,
     )
     .bind(new_id("cus"))
     .bind(workspace_id)
+    .bind(app_id)
     .bind(app_user_id)
     .bind(apple)
     .bind(google)

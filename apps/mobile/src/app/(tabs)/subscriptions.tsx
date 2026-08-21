@@ -4,19 +4,20 @@ import { useQuery } from '@tanstack/react-query';
 import { NativeListScreen } from '@/components/native-list-screen';
 import { useTheme } from '@/hooks/use-theme';
 import { formatDate, formatStatus } from '@/lib/format';
-import { useApi } from '@/providers/auth';
+import { useApi, useAuth } from '@/providers/auth';
 
 export default function SubscriptionsScreen() {
   const api = useApi();
+  const { selectedApp, selectedAppId } = useAuth();
   const theme = useTheme();
   const subscriptions = useQuery({
-    queryKey: ['subscriptions'],
-    queryFn: () => api.subscriptions({ environment: 'production' }),
+    queryKey: ['subscriptions', selectedAppId],
+    queryFn: () => api.subscriptions({ environment: 'production', app_id: selectedAppId ?? undefined }),
   });
   const items = subscriptions.data?.subscriptions ?? [];
 
   return (
-    <NativeListScreen subtitle={`${items.length} production subscriptions`} title="Subscriptions">
+    <NativeListScreen subtitle={`${selectedApp ? `${selectedApp.name} · ` : ''}${items.length} production subscriptions`} title="Subscriptions">
       <List onRefresh={async () => void (await subscriptions.refetch())}>
         {subscriptions.error ? (
           <ListItem supportingText={subscriptions.error.message}>Couldn’t load subscriptions</ListItem>
