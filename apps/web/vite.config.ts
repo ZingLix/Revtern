@@ -8,23 +8,6 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react(), tailwindcss()],
-    build: {
-      rolldownOptions: {
-        output: {
-          codeSplitting: {
-            groups: [
-              {
-                name: "vendor",
-                test: /node_modules[\\/]/,
-                minSize: 80_000,
-                maxSize: 450_000,
-                priority: 10,
-              },
-            ],
-          },
-        },
-      },
-    },
     server: {
       port: 3000,
       proxy: {
