@@ -6,6 +6,7 @@
 .envrc
 .direnv/
 *.pem
+!crates/api/certs/apple-root-certificates.pem
 *.key
 *.p8
 *.p12

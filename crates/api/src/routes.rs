@@ -1063,7 +1063,8 @@ async fn list_data_sources(
 ) -> ApiResult<Json<Value>> {
     let rows = sqlx::query(
         r#"
-        select ds.*, a.name as app_name
+        select ds.*, a.name as app_name, a.apple_bundle_id as app_apple_bundle_id,
+               a.google_package_name as app_google_package_name
         from data_sources ds
         left join apps a on a.id = ds.app_id
         where has_app_permission($1, ds.app_id, 'app.read')
@@ -1103,9 +1104,12 @@ async fn create_data_source(
         Capability::SourceWrite
     };
     let app_access = access::require_app(&state.pool, &user, app_id, required).await?;
-    let (encrypted_credentials, webhook_secret_hash) =
-        prepare_source_credentials(&state, input.credentials)?;
     let id = new_id("src");
+    let credentials =
+        merge_source_credentials(&state, &source_type, app_id, &id, None, input.credentials)
+            .await?;
+    let (encrypted_credentials, webhook_secret_hash) =
+        prepare_source_credentials(&state, credentials)?;
     sqlx::query(
         r#"
         insert into data_sources (
@@ -1158,15 +1162,26 @@ async fn update_data_source_credentials(
     Path(source_id): Path<String>,
     Json(input): Json<DataSourceCredentialsRequest>,
 ) -> ApiResult<Json<Value>> {
-    let (_, source_access) = authorized_source_row(
+    let (source, source_access) = authorized_source_row(
         &state,
         &user,
         &source_id,
         Capability::SourceCredentialsWrite,
     )
     .await?;
+    let source_type: String = source.try_get("source_type")?;
+    let existing_credentials: Option<String> = source.try_get("encrypted_credentials")?;
+    let credentials = merge_source_credentials(
+        &state,
+        &source_type,
+        &source_access.app_id,
+        &source_id,
+        existing_credentials.as_deref(),
+        input.credentials,
+    )
+    .await?;
     let (encrypted_credentials, webhook_secret_hash) =
-        prepare_source_credentials(&state, input.credentials)?;
+        prepare_source_credentials(&state, credentials)?;
     sqlx::query(
         r#"
         update data_sources
@@ -2181,6 +2196,9 @@ async fn run_webhook_catch_up(
         if source_type == "app_store" {
             webhook_verification::verify_app_store_payload(&payload, Some(&credentials))
                 .map_err(|error| ApiError::Unauthorized(error.to_string()))?;
+        } else if source_type == "google_play" {
+            webhook_verification::verify_google_play_package(&payload, Some(&credentials))
+                .map_err(|error| ApiError::Unauthorized(error.to_string()))?;
         }
         let stored = store_webhook_payload(state, &payload, &store_context).await?;
         if stored.inserted {
@@ -2362,6 +2380,13 @@ async fn ingest_webhook(
                         .to_string(),
                 ));
             }
+            webhook_verification::verify_google_play_package(&payload, credentials.as_ref())
+                .map_err(|error| {
+                    tracing::warn!(source_id, ?error, "rejected Google Play package mismatch");
+                    ApiError::Unauthorized(
+                        "Google Play notification package verification failed".to_string(),
+                    )
+                })?;
             true
         }
         _ => {
@@ -2673,7 +2698,8 @@ async fn get_data_source_json(
 ) -> ApiResult<Value> {
     let row = sqlx::query(
         r#"
-        select ds.*, a.name as app_name
+        select ds.*, a.name as app_name, a.apple_bundle_id as app_apple_bundle_id,
+               a.google_package_name as app_google_package_name
         from data_sources ds
         left join apps a on a.id = ds.app_id
         where ds.workspace_id = $1 and ds.id = $2
@@ -3029,6 +3055,136 @@ fn optional_source_credentials(
         .transpose()
 }
 
+async fn merge_source_credentials(
+    state: &AppState,
+    source_type: &str,
+    app_id: &str,
+    source_id: &str,
+    existing_credentials: Option<&str>,
+    incoming_credentials: Option<Value>,
+) -> ApiResult<Option<Value>> {
+    let mut merged = merge_credential_values(
+        optional_source_credentials(state, existing_credentials)?,
+        incoming_credentials,
+    )?;
+    let merged_object = merged
+        .as_object_mut()
+        .ok_or_else(|| ApiError::invalid("source credentials must be a JSON object"))?;
+
+    if source_type == "app_store" {
+        let bundle_id: Option<String> =
+            sqlx::query_scalar("select apple_bundle_id from apps where id = $1")
+                .bind(app_id)
+                .fetch_optional(&state.pool)
+                .await?
+                .flatten();
+        let bundle_id = bundle_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ApiError::invalid(
+                    "Add the Apple bundle ID to the selected app before connecting App Store",
+                )
+            })?;
+        merged_object.insert("bundle_id".to_string(), json!(bundle_id));
+        merged_object
+            .entry("environment".to_string())
+            .or_insert_with(|| json!("both"));
+    }
+    if source_type == "google_play" {
+        let package_name: Option<String> =
+            sqlx::query_scalar("select google_package_name from apps where id = $1")
+                .bind(app_id)
+                .fetch_optional(&state.pool)
+                .await?
+                .flatten();
+        let package_name = package_name
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ApiError::invalid(
+                    "Add the Google package name to the selected app before connecting Google Play",
+                )
+            })?;
+        merged_object.insert("package_name".to_string(), json!(package_name));
+        merged_object.insert(
+            "pubsub_oidc_audience".to_string(),
+            json!(format!(
+                "{}/webhooks/google-play/{source_id}",
+                state.config.base_url.trim_end_matches('/')
+            )),
+        );
+    }
+
+    Ok((!merged_object.is_empty()).then_some(merged))
+}
+
+fn merge_credential_values(existing: Option<Value>, incoming: Option<Value>) -> ApiResult<Value> {
+    let mut merged = existing.unwrap_or_else(|| json!({}));
+    let merged_object = merged
+        .as_object_mut()
+        .ok_or_else(|| ApiError::invalid("source credentials must be a JSON object"))?;
+    if let Some(incoming) = incoming {
+        let incoming = incoming
+            .as_object()
+            .ok_or_else(|| ApiError::invalid("source credentials must be a JSON object"))?;
+        for (key, value) in incoming {
+            let empty_string = value.as_str().is_some_and(|value| value.trim().is_empty());
+            if !value.is_null() && !empty_string {
+                merged_object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Ok(merged)
+}
+
+#[cfg(test)]
+mod source_credentials_tests {
+    use super::*;
+
+    #[test]
+    fn credential_updates_keep_existing_secrets_when_fields_are_blank() {
+        let merged = merge_credential_values(
+            Some(json!({
+                "issuer_id": "issuer",
+                "key_id": "old-key",
+                "private_key": "private"
+            })),
+            Some(json!({
+                "environment": "both",
+                "key_id": "",
+                "private_key": null
+            })),
+        )
+        .expect("merge credentials");
+
+        assert_eq!(merged["issuer_id"], "issuer");
+        assert_eq!(merged["key_id"], "old-key");
+        assert_eq!(merged["private_key"], "private");
+        assert_eq!(merged["environment"], "both");
+    }
+
+    #[test]
+    fn reads_google_service_account_email_without_exposing_the_private_key() {
+        let object_credentials = json!({
+            "service_account_json": {
+                "client_email": "revtern@example.iam.gserviceaccount.com",
+                "private_key": "secret"
+            }
+        });
+        let string_credentials = json!({
+            "service_account_json": "{\"client_email\":\"legacy@example.iam.gserviceaccount.com\",\"private_key\":\"secret\"}"
+        });
+
+        assert_eq!(
+            google_service_account_email(&object_credentials).as_deref(),
+            Some("revtern@example.iam.gserviceaccount.com")
+        );
+        assert_eq!(
+            google_service_account_email(&string_credentials).as_deref(),
+            Some("legacy@example.iam.gserviceaccount.com")
+        );
+    }
+}
+
 fn prepare_source_credentials(
     state: &AppState,
     credentials: Option<Value>,
@@ -3246,21 +3402,80 @@ fn app_with_access_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {
 fn data_source_json(state: &AppState, row: sqlx::postgres::PgRow) -> ApiResult<Value> {
     let id: String = row.try_get("id")?;
     let source_type: String = row.try_get("source_type")?;
+    let webhook_url = format!(
+        "{}/webhooks/{}/{}",
+        state.config.base_url.trim_end_matches('/'),
+        source_type.replace('_', "-"),
+        id
+    );
     let encrypted_credentials: Option<String> = row.try_get("encrypted_credentials")?;
     let has_credentials = encrypted_credentials.is_some();
-    let credential_keys = credential_keys(state, encrypted_credentials.as_deref());
+    let credentials = optional_source_credentials(state, encrypted_credentials.as_deref())?;
+    let app_apple_bundle_id = row
+        .try_get::<Option<String>, _>("app_apple_bundle_id")
+        .ok()
+        .flatten();
+    let app_google_package_name = row
+        .try_get::<Option<String>, _>("app_google_package_name")
+        .ok()
+        .flatten();
+    let credential_keys = credentials
+        .as_ref()
+        .and_then(Value::as_object)
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let has_google_api_credentials = credential_keys.iter().any(|key| {
+        matches!(
+            key.as_str(),
+            "service_account_json" | "android_publisher_access_token" | "access_token"
+        )
+    });
+    let catch_up_configured = match source_type.as_str() {
+        "app_store" => ["issuer_id", "key_id", "private_key"]
+            .iter()
+            .all(|key| credential_keys.iter().any(|configured| configured == key)),
+        "google_play" => {
+            credential_keys
+                .iter()
+                .any(|key| key == "pubsub_subscription" || key == "subscription")
+                && has_google_api_credentials
+        }
+        _ => false,
+    };
+    let purchase_verification_configured = source_type == "google_play"
+        && credential_keys.iter().any(|key| {
+            matches!(
+                key.as_str(),
+                "service_account_json" | "android_publisher_access_token" | "access_token"
+            )
+        });
+    let configuration = match source_type.as_str() {
+        "app_store" => json!({
+            "bundle_id": credentials.as_ref().and_then(|value| value.get("bundle_id")).and_then(Value::as_str).or(app_apple_bundle_id.as_deref()),
+            "environment": credentials.as_ref().and_then(|value| value.get("environment")).and_then(Value::as_str).unwrap_or("both"),
+            "app_apple_id": credentials.as_ref().and_then(|value| value.get("app_apple_id")).and_then(Value::as_str),
+        }),
+        "google_play" => json!({
+            "package_name": credentials.as_ref().and_then(|value| value.get("package_name")).and_then(Value::as_str).or(app_google_package_name.as_deref()),
+            "pubsub_oidc_audience": credentials.as_ref().and_then(|value| value.get("pubsub_oidc_audience")).and_then(Value::as_str).unwrap_or(webhook_url.as_str()),
+            "pubsub_service_account_email": credentials.as_ref().and_then(|value| value.get("pubsub_service_account_email")).and_then(Value::as_str),
+            "pubsub_subscription": credentials.as_ref().and_then(|value| value.get("pubsub_subscription").or_else(|| value.get("subscription"))).and_then(Value::as_str),
+            "credential_service_account_email": credentials.as_ref().and_then(google_service_account_email),
+        }),
+        _ => json!({}),
+    };
+    let app_store_environment = configuration
+        .get("environment")
+        .and_then(Value::as_str)
+        .unwrap_or("both");
+    let app_store_identity_configured = credential_keys.iter().any(|key| key == "bundle_id")
+        && (app_store_environment == "sandbox"
+            || credential_keys.iter().any(|key| key == "app_apple_id"));
     let has_webhook_secret = row
         .try_get::<Option<String>, _>("webhook_secret_hash")?
         .is_some();
     let verification_mode = match source_type.as_str() {
-        "app_store"
-            if credential_keys
-                .iter()
-                .any(|key| key == "apple_root_certificates" || key == "apple_root_ca_pem")
-                && credential_keys.iter().any(|key| key == "bundle_id") =>
-        {
-            "apple_jws"
-        }
+        "app_store" if app_store_identity_configured => "apple_jws",
         "google_play"
             if credential_keys
                 .iter()
@@ -3284,6 +3499,9 @@ fn data_source_json(state: &AppState, row: sqlx::postgres::PgRow) -> ApiResult<V
         "status": row.try_get::<String, _>("status")?,
         "has_credentials": has_credentials,
         "credential_keys": &credential_keys,
+        "catch_up_configured": catch_up_configured,
+        "purchase_verification_configured": purchase_verification_configured,
+        "configuration": configuration,
         "has_webhook_secret": has_webhook_secret,
         "verification_mode": verification_mode,
         "last_event_at": opt_dt(row.try_get::<Option<OffsetDateTime>, _>("last_event_at")?),
@@ -3291,16 +3509,36 @@ fn data_source_json(state: &AppState, row: sqlx::postgres::PgRow) -> ApiResult<V
         "last_error": row.try_get::<Option<String>, _>("last_error")?,
         "created_at": dt(row.try_get::<OffsetDateTime, _>("created_at")?),
         "updated_at": dt(row.try_get::<OffsetDateTime, _>("updated_at")?),
-        "webhook_url": format!("{}/webhooks/{}/{}", state.config.base_url.trim_end_matches('/'), source_type.replace('_', "-"), row.try_get::<String, _>("id")?),
-        "setup_checklist": setup_checklist(&source_type, row.try_get::<Option<OffsetDateTime>, _>("last_event_at")?.is_some(), verification_mode, has_credentials)
+        "webhook_url": webhook_url,
+        "setup_checklist": setup_checklist(&source_type, row.try_get::<Option<OffsetDateTime>, _>("last_event_at")?.is_some(), verification_mode, catch_up_configured, purchase_verification_configured)
     }))
+}
+
+fn google_service_account_email(credentials: &Value) -> Option<String> {
+    let service_account = credentials.get("service_account_json")?;
+    if let Some(object) = service_account.as_object() {
+        return object
+            .get("client_email")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    service_account
+        .as_str()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("client_email")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 fn setup_checklist(
     source_type: &str,
     has_event: bool,
     verification_mode: &str,
-    has_credentials: bool,
+    catch_up_configured: bool,
+    purchase_verification_configured: bool,
 ) -> Vec<Value> {
     match source_type {
         "revenuecat" => vec![
@@ -3310,14 +3548,15 @@ fn setup_checklist(
         ],
         "app_store" => vec![
             json!({"key": "notifications", "label": "Configure App Store Server Notification URL", "done": true}),
-            json!({"key": "verification", "label": "Configure Apple root certificate and app identity", "done": verification_mode == "apple_jws"}),
-            json!({"key": "catch_up", "label": "Configure notification-history catch-up credentials", "done": has_credentials}),
+            json!({"key": "verification", "label": "Configure app identity for signed notification verification", "done": verification_mode == "apple_jws"}),
+            json!({"key": "catch_up", "label": "Configure missed-notification recovery", "done": catch_up_configured, "optional": true}),
             json!({"key": "signed_payload", "label": "Receive and verify a signedPayload notification", "done": has_event}),
         ],
         "google_play" => vec![
             json!({"key": "pubsub", "label": "Configure Pub/Sub push endpoint", "done": true}),
             json!({"key": "verification", "label": "Configure Pub/Sub OIDC audience and service account", "done": verification_mode == "google_oidc" || verification_mode == "shared_secret"}),
-            json!({"key": "store_credentials", "label": "Configure Pub/Sub and Play API credentials", "done": has_credentials}),
+            json!({"key": "purchase_verification", "label": "Verify purchases with Android Publisher API", "done": purchase_verification_configured, "optional": true}),
+            json!({"key": "catch_up", "label": "Configure missed-notification recovery", "done": catch_up_configured, "optional": true}),
             json!({"key": "rtdn", "label": "Receive RTDN message", "done": has_event}),
         ],
         _ => vec![
@@ -3326,21 +3565,6 @@ fn setup_checklist(
             json!({"key": "catalog", "label": "Confirm discovered product catalog", "done": false}),
         ],
     }
-}
-
-fn credential_keys(state: &AppState, encrypted_credentials: Option<&str>) -> Vec<String> {
-    let Some(encrypted_credentials) = encrypted_credentials else {
-        return vec![];
-    };
-    crypto::decrypt_json(&state.config.secret_key, encrypted_credentials)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| {
-            value
-                .as_object()
-                .map(|object| object.keys().cloned().collect())
-        })
-        .unwrap_or_default()
 }
 
 fn source_product_json(row: sqlx::postgres::PgRow) -> ApiResult<Value> {

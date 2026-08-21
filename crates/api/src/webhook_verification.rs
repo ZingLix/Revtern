@@ -16,6 +16,8 @@ use openssl::{
 use serde::Deserialize;
 use serde_json::Value;
 
+const APPLE_ROOT_CERTIFICATES_PEM: &str = include_str!("../certs/apple-root-certificates.pem");
+
 #[derive(Debug, Deserialize)]
 struct AppleJwsHeader {
     alg: String,
@@ -55,9 +57,8 @@ pub fn verify_shared_secret(
 }
 
 pub fn verify_app_store_payload(payload: &Value, credentials: Option<&Value>) -> Result<Value> {
-    let credentials = credentials.context(
-        "App Store verification credentials are required (bundle_id, environment, and Apple root certificate)",
-    )?;
+    let credentials =
+        credentials.context("App Store verification credentials are required (bundle_id)")?;
     let signed_payload = payload
         .get("signedPayload")
         .and_then(Value::as_str)
@@ -169,6 +170,36 @@ pub async fn verify_google_pubsub_oidc(
     Ok(true)
 }
 
+pub fn verify_google_play_package(payload: &Value, credentials: Option<&Value>) -> Result<()> {
+    let Some(expected_package) =
+        credentials.and_then(|value| credential_string(value, "package_name"))
+    else {
+        return Ok(());
+    };
+    let notification = payload
+        .get("message")
+        .and_then(|message| message.get("data"))
+        .and_then(Value::as_str)
+        .map(|encoded| {
+            let bytes = STANDARD
+                .decode(encoded)
+                .context("invalid Google Pub/Sub message.data encoding")?;
+            serde_json::from_slice::<Value>(&bytes)
+                .context("invalid Google Play developer notification JSON")
+        })
+        .transpose()?
+        .unwrap_or_else(|| payload.clone());
+    let actual_package = notification
+        .get("packageName")
+        .or_else(|| notification.get("package_name"))
+        .and_then(Value::as_str)
+        .context("Google Play developer notification is missing packageName")?;
+    if actual_package != expected_package {
+        bail!("Google Play package name does not match the configured app");
+    }
+    Ok(())
+}
+
 fn verify_apple_jws(jws: &str, roots: &[X509]) -> Result<Value> {
     let mut parts = jws.split('.');
     let header_part = parts.next().context("JWS header is missing")?;
@@ -239,7 +270,8 @@ fn verify_apple_jws(jws: &str, roots: &[X509]) -> Result<Value> {
 }
 
 fn apple_root_certificates(credentials: &Value) -> Result<Vec<X509>> {
-    let mut roots = vec![];
+    let mut roots = X509::stack_from_pem(APPLE_ROOT_CERTIFICATES_PEM.as_bytes())
+        .context("parse bundled Apple root certificates")?;
     if let Some(values) = credentials
         .get("apple_root_certificates")
         .and_then(Value::as_array)
@@ -258,9 +290,6 @@ fn apple_root_certificates(credentials: &Value) -> Result<Vec<X509>> {
         roots.extend(
             X509::stack_from_pem(pem.as_bytes()).context("invalid Apple root certificate PEM")?,
         );
-    }
-    if roots.is_empty() {
-        bail!("App Store verification requires apple_root_certificates or apple_root_ca_pem");
     }
     Ok(roots)
 }
@@ -326,9 +355,32 @@ mod tests {
     fn app_store_verification_never_accepts_an_unsigned_body() {
         let credentials = json!({
             "bundle_id": "com.example.app",
-            "environment": "sandbox",
-            "apple_root_ca_pem": "not a certificate"
+            "environment": "sandbox"
         });
         assert!(verify_app_store_payload(&json!({}), Some(&credentials)).is_err());
+    }
+
+    #[test]
+    fn bundled_apple_root_certificates_are_available() {
+        let roots = apple_root_certificates(&json!({})).expect("bundled Apple roots");
+        assert_eq!(roots.len(), 3);
+    }
+
+    #[test]
+    fn google_play_package_must_match_the_configured_app() {
+        let credentials = json!({ "package_name": "com.example.app" });
+        let matching = json!({
+            "message": {
+                "data": STANDARD.encode(br#"{"packageName":"com.example.app"}"#)
+            }
+        });
+        let mismatched = json!({
+            "message": {
+                "data": STANDARD.encode(br#"{"packageName":"com.example.other"}"#)
+            }
+        });
+
+        assert!(verify_google_play_package(&matching, Some(&credentials)).is_ok());
+        assert!(verify_google_play_package(&mismatched, Some(&credentials)).is_err());
     }
 }

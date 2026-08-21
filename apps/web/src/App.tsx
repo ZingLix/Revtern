@@ -43,6 +43,7 @@ import {
   LineChartIcon,
   ListChecks,
   LogOut,
+  Minus,
   Plus,
   RadioTower,
   Receipt,
@@ -1192,7 +1193,7 @@ function SourcesPage() {
                 onConfigureCatchUp={selectedApp?.permissions.includes("source.credentials.write") && supportsCatchUp(source.source_type)
                   ? (credentials) => updateCredentials.mutate({ id: source.id, credentials })
                   : undefined}
-                onCatchUp={selectedApp?.permissions.includes("source.write") && supportsCatchUp(source.source_type) && source.has_credentials ? () => catchUp.mutate(source.id) : undefined}
+                onCatchUp={selectedApp?.permissions.includes("source.write") && supportsCatchUp(source.source_type) && source.catch_up_configured ? () => catchUp.mutate(source.id) : undefined}
                 configurePending={updateCredentials.isPending && updateCredentials.variables?.id === source.id}
                 configureError={updateCredentials.variables?.id === source.id ? updateCredentials.error : null}
               />
@@ -1539,7 +1540,17 @@ function SourceForm({
   const [appId, setAppId] = useState("");
   const [secret, setSecret] = useState("");
   const [catchUpText, setCatchUpText] = useState("");
+  const [appAppleId, setAppAppleId] = useState("");
+  const [appStoreEnvironment, setAppStoreEnvironment] = useState("both");
+  const [appStoreIssuerId, setAppStoreIssuerId] = useState("");
+  const [appStoreKeyId, setAppStoreKeyId] = useState("");
+  const [appStorePrivateKey, setAppStorePrivateKey] = useState("");
+  const [googlePushServiceAccountEmail, setGooglePushServiceAccountEmail] = useState("");
+  const [googleSubscription, setGoogleSubscription] = useState("");
+  const [googleServiceAccount, setGoogleServiceAccount] = useState<Record<string, unknown> | null>(null);
+  const [googleServiceAccountFileName, setGoogleServiceAccountFileName] = useState("");
   const [parseError, setParseError] = useState<string | null>(null);
+  const sourceApp = apps.find((app) => app.id === appId);
 
   useEffect(() => {
     if (initialAppId && apps.some((app) => app.id === initialAppId)) {
@@ -1553,7 +1564,48 @@ function SourceForm({
     event.preventDefault();
     setParseError(null);
     let credentials: Record<string, unknown> = {};
-    if (allowCredentials && supportsCatchUp(sourceType) && catchUpText.trim()) {
+    if (sourceType === "app_store") {
+      if (!sourceApp?.apple_bundle_id) {
+        setParseError("Add an Apple bundle ID to this app before connecting App Store.");
+        return;
+      }
+      if (allowCredentials) {
+        if (appStoreEnvironment !== "sandbox" && !appAppleId.trim()) {
+          setParseError("Apple ID is required for production notifications.");
+          return;
+        }
+        credentials.environment = appStoreEnvironment;
+        if (appAppleId.trim()) credentials.app_apple_id = appAppleId.trim();
+        const historyValues = [appStoreIssuerId, appStoreKeyId, appStorePrivateKey].map((value) => value.trim());
+        if (historyValues.some(Boolean) && !historyValues.every(Boolean)) {
+          setParseError("Issuer ID, Key ID, and private key are all required to enable missed-notification recovery.");
+          return;
+        }
+        if (historyValues.every(Boolean)) {
+          credentials.issuer_id = historyValues[0];
+          credentials.key_id = historyValues[1];
+          credentials.private_key = historyValues[2];
+        }
+      }
+    } else if (sourceType === "google_play") {
+      if (!sourceApp?.google_package_name) {
+        setParseError("Add a Google package name to this app before connecting Google Play.");
+        return;
+      }
+      if (allowCredentials) {
+        if (!googlePushServiceAccountEmail.trim()) {
+          setParseError("Push authentication service account email is required.");
+          return;
+        }
+        if (googleSubscription.trim() && !/^projects\/[^/]+\/subscriptions\/[^/]+$/.test(googleSubscription.trim())) {
+          setParseError("Subscription path must use projects/PROJECT_ID/subscriptions/SUBSCRIPTION_ID.");
+          return;
+        }
+        credentials.pubsub_service_account_email = googlePushServiceAccountEmail.trim();
+        if (googleSubscription.trim()) credentials.pubsub_subscription = googleSubscription.trim();
+        if (googleServiceAccount) credentials.service_account_json = googleServiceAccount;
+      }
+    } else if (allowCredentials && supportsCatchUp(sourceType) && catchUpText.trim()) {
       try {
         const parsed = JSON.parse(catchUpText) as unknown;
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -1566,7 +1618,7 @@ function SourceForm({
         return;
       }
     }
-    if (allowCredentials && secret) credentials.webhook_secret = secret;
+    if (allowCredentials && !["app_store", "google_play"].includes(sourceType) && secret) credentials.webhook_secret = secret;
     const payload = Object.keys(credentials).length ? credentials : undefined;
     onSubmit({ source_type: sourceType, name, app_id: appId || null, credentials: payload });
   }
@@ -1581,6 +1633,15 @@ function SourceForm({
             setSourceType(next);
             setName(defaultSourceName(next));
             setCatchUpText("");
+            setAppAppleId("");
+            setAppStoreEnvironment("both");
+            setAppStoreIssuerId("");
+            setAppStoreKeyId("");
+            setAppStorePrivateKey("");
+            setGooglePushServiceAccountEmail("");
+            setGoogleSubscription("");
+            setGoogleServiceAccount(null);
+            setGoogleServiceAccountFileName("");
             setParseError(null);
           }}
           options={[
@@ -1600,16 +1661,55 @@ function SourceForm({
         <SelectControl
           ariaLabel="Source app"
           value={appId}
-          onChange={setAppId}
+          onChange={(next) => {
+            setAppId(next);
+            if (sourceType === "app_store") setAppAppleId("");
+          }}
           options={[
             ...apps.map((app) => ({ value: app.id, label: app.name })),
           ]}
         />
       </Field>
-      {allowCredentials ? <Field label="Webhook secret">
+      {allowCredentials && !["app_store", "google_play"].includes(sourceType) ? <Field label="Webhook secret">
         <Input fullWidth value={secret} onChange={(event) => setSecret(event.target.value)} placeholder="Optional shared secret" variant="secondary" />
       </Field> : null}
-      {allowCredentials && supportsCatchUp(sourceType) ? (
+      {sourceType === "app_store" ? (
+        allowCredentials ? (
+          <AppStoreCredentialsFields
+            appAppleId={appAppleId}
+            bundleId={sourceApp?.apple_bundle_id ?? null}
+            environment={appStoreEnvironment}
+            issuerId={appStoreIssuerId}
+            keyId={appStoreKeyId}
+            onAppAppleIdChange={setAppAppleId}
+            onEnvironmentChange={setAppStoreEnvironment}
+            onIssuerIdChange={setAppStoreIssuerId}
+            onKeyIdChange={setAppStoreKeyId}
+            onPrivateKeyChange={setAppStorePrivateKey}
+            privateKey={appStorePrivateKey}
+          />
+        ) : (
+          <p className="muted">An owner or admin must finish the App Store identity settings after this source is created.</p>
+        )
+      ) : sourceType === "google_play" ? (
+        allowCredentials ? (
+          <GooglePlayCredentialsFields
+            packageName={sourceApp?.google_package_name ?? null}
+            pushServiceAccountEmail={googlePushServiceAccountEmail}
+            serviceAccount={googleServiceAccount}
+            serviceAccountFileName={googleServiceAccountFileName}
+            subscription={googleSubscription}
+            onPushServiceAccountEmailChange={setGooglePushServiceAccountEmail}
+            onServiceAccountChange={(value, fileName) => {
+              setGoogleServiceAccount(value);
+              setGoogleServiceAccountFileName(fileName);
+            }}
+            onSubscriptionChange={setGoogleSubscription}
+          />
+        ) : (
+          <p className="muted">An owner or admin must finish the Google Play push authentication settings after this source is created.</p>
+        )
+      ) : allowCredentials && supportsCatchUp(sourceType) ? (
         <Field label="Source credentials and verification JSON">
           <TextArea
             fullWidth
@@ -1628,6 +1728,226 @@ function SourceForm({
         Add source
       </Button>
     </form>
+  );
+}
+
+function AppStoreCredentialsFields({
+  appAppleId,
+  bundleId,
+  environment,
+  issuerId,
+  keyId,
+  privateKey,
+  catchUpConfigured = false,
+  onAppAppleIdChange,
+  onEnvironmentChange,
+  onIssuerIdChange,
+  onKeyIdChange,
+  onPrivateKeyChange,
+}: {
+  appAppleId: string;
+  bundleId?: string | null;
+  environment: string;
+  issuerId: string;
+  keyId: string;
+  privateKey: string;
+  catchUpConfigured?: boolean;
+  onAppAppleIdChange: (value: string) => void;
+  onEnvironmentChange: (value: string) => void;
+  onIssuerIdChange: (value: string) => void;
+  onKeyIdChange: (value: string) => void;
+  onPrivateKeyChange: (value: string) => void;
+}) {
+  return (
+    <div className="source-form-section">
+      <div className="source-form-heading">
+        <strong>Live notifications</strong>
+        <span>Apple root certificates and the webhook endpoint are managed automatically.</span>
+      </div>
+      <div className={`derived-field${bundleId ? "" : " derived-field--missing"}`}>
+        <span>Bundle ID</span>
+        <code>{bundleId ?? "Missing from app settings"}</code>
+        <small>{bundleId ? "From the selected app" : "Add it in Apps before continuing"}</small>
+      </div>
+      <div className="source-form-grid">
+        <Field label={environment === "sandbox" ? "Apple ID (optional in Sandbox)" : "Apple ID"}>
+          <Input
+            fullWidth
+            inputMode="numeric"
+            value={appAppleId}
+            onChange={(event) => onAppAppleIdChange(event.target.value.replace(/\D/g, ""))}
+            placeholder="1234567890"
+            required={environment !== "sandbox"}
+            variant="secondary"
+          />
+          <span className="field-help">The numeric Apple ID shown in App Store Connect.</span>
+        </Field>
+        <Field label="Environment">
+          <SelectControl
+            ariaLabel="App Store environment"
+            value={environment}
+            onChange={onEnvironmentChange}
+            options={[
+              { value: "both", label: "Production and Sandbox" },
+              { value: "production", label: "Production only" },
+              { value: "sandbox", label: "Sandbox only" },
+            ]}
+          />
+        </Field>
+      </div>
+      <details className="advanced-settings">
+        <summary>
+          <span>Missed-notification recovery</span>
+          <small>{catchUpConfigured ? "Configured · leave blank to keep current key" : "Optional"}</small>
+        </summary>
+        <div className="advanced-settings__content">
+          <p>Only needed to use Catch up. Create an In-App Purchase key in App Store Connect.</p>
+          <div className="source-form-grid">
+            <Field label="Issuer ID">
+              <Input fullWidth value={issuerId} onChange={(event) => onIssuerIdChange(event.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" variant="secondary" />
+            </Field>
+            <Field label="Key ID">
+              <Input fullWidth value={keyId} onChange={(event) => onKeyIdChange(event.target.value)} placeholder="ABC123DEFG" variant="secondary" />
+            </Field>
+          </div>
+          <Field label="Private key (.p8 contents)">
+            <TextArea
+              fullWidth
+              value={privateKey}
+              onChange={(event) => onPrivateKeyChange(event.target.value)}
+              placeholder="-----BEGIN PRIVATE KEY-----"
+              rows={5}
+              variant="secondary"
+            />
+          </Field>
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function GooglePlayCredentialsFields({
+  packageName,
+  webhookAudience,
+  pushServiceAccountEmail,
+  subscription,
+  serviceAccount,
+  serviceAccountFileName,
+  serviceAccountConfigured = false,
+  sharedSecretConfigured = false,
+  catchUpConfigured = false,
+  purchaseVerificationConfigured = false,
+  onPushServiceAccountEmailChange,
+  onSubscriptionChange,
+  onServiceAccountChange,
+}: {
+  packageName?: string | null;
+  webhookAudience?: string | null;
+  pushServiceAccountEmail: string;
+  subscription: string;
+  serviceAccount: Record<string, unknown> | null;
+  serviceAccountFileName: string;
+  serviceAccountConfigured?: boolean;
+  sharedSecretConfigured?: boolean;
+  catchUpConfigured?: boolean;
+  purchaseVerificationConfigured?: boolean;
+  onPushServiceAccountEmailChange: (value: string) => void;
+  onSubscriptionChange: (value: string) => void;
+  onServiceAccountChange: (value: Record<string, unknown> | null, fileName: string) => void;
+}) {
+  const [fileError, setFileError] = useState<string | null>(null);
+
+  async function selectServiceAccountFile(file?: File) {
+    setFileError(null);
+    if (!file) {
+      onServiceAccountChange(null, "");
+      return;
+    }
+    try {
+      const parsed = JSON.parse(await file.text()) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid object");
+      const serviceAccount = parsed as Record<string, unknown>;
+      const clientEmail = typeof serviceAccount.client_email === "string" ? serviceAccount.client_email.trim() : "";
+      const privateKey = typeof serviceAccount.private_key === "string" ? serviceAccount.private_key.trim() : "";
+      if (!clientEmail || !privateKey) throw new Error("missing fields");
+      onServiceAccountChange(serviceAccount, file.name);
+      if (!pushServiceAccountEmail.trim()) onPushServiceAccountEmailChange(clientEmail);
+    } catch {
+      onServiceAccountChange(null, "");
+      setFileError("Choose a Google service account JSON file containing client_email and private_key.");
+    }
+  }
+
+  return (
+    <div className="source-form-section">
+      <div className="source-form-heading">
+        <strong>Live notifications</strong>
+        <span>The package name and OIDC audience are managed automatically.</span>
+      </div>
+      <div className={`derived-field${packageName ? "" : " derived-field--missing"}`}>
+        <span>Package name</span>
+        <code>{packageName ?? "Missing from app settings"}</code>
+        <small>{packageName ? "From the selected app" : "Add it in Apps before continuing"}</small>
+      </div>
+      <div className="derived-field">
+        <span>OIDC audience</span>
+        <code>{webhookAudience ?? "Generated with the webhook URL"}</code>
+        <small>Use this value in the Pub/Sub push subscription</small>
+      </div>
+      <Field label={sharedSecretConfigured ? "Push authentication service account email (optional)" : "Push authentication service account email"}>
+        <Input
+          fullWidth
+          type="email"
+          value={pushServiceAccountEmail}
+          onChange={(event) => onPushServiceAccountEmailChange(event.target.value)}
+          placeholder="pubsub-push@example.iam.gserviceaccount.com"
+          required={!sharedSecretConfigured}
+          variant="secondary"
+        />
+        <span className="field-help">
+          {sharedSecretConfigured
+            ? "This source currently uses an edge-provided shared secret. Add an email to switch to Pub/Sub OIDC."
+            : "The service account selected under Pub/Sub push authentication."}
+        </span>
+      </Field>
+      <details className="advanced-settings">
+        <summary>
+          <span>Purchase verification and recovery</span>
+          <small>{catchUpConfigured ? "Recovery configured" : purchaseVerificationConfigured ? "Purchase verification configured" : "Optional"}</small>
+        </summary>
+        <div className="advanced-settings__content">
+          <p>Upload a service account key to verify purchases with Android Publisher API. Add a subscription path to also enable Catch up.</p>
+          <Field label="Service account key (.json)">
+            <input
+              accept=".json,application/json"
+              aria-label="Google service account key file"
+              className="file-input"
+              onChange={(event) => void selectServiceAccountFile(event.target.files?.[0])}
+              type="file"
+            />
+            <span className="field-help">
+              {serviceAccountFileName
+                ? `${serviceAccountFileName} selected`
+                : serviceAccountConfigured
+                  ? "A key is already configured. Choose a file only to replace it."
+                  : "The key is encrypted before it is stored."}
+            </span>
+          </Field>
+          {fileError ? <p className="form-error">{fileError}</p> : null}
+          <Field label="Pub/Sub subscription path">
+            <Input
+              fullWidth
+              value={subscription}
+              onChange={(event) => onSubscriptionChange(event.target.value)}
+              placeholder="projects/PROJECT_ID/subscriptions/SUBSCRIPTION_ID"
+              variant="secondary"
+            />
+            <span className="field-help">Optional. Required only for pulling retained RTDN messages.</span>
+          </Field>
+          {serviceAccount ? <span className="credential-ready">Service account file is ready to save.</span> : null}
+        </div>
+      </details>
+    </div>
   );
 }
 
@@ -1650,10 +1970,55 @@ function SourceCard({
   const [editingCredentials, setEditingCredentials] = useState(false);
   const [credentialsText, setCredentialsText] = useState("");
   const [credentialsParseError, setCredentialsParseError] = useState<string | null>(null);
+  const [appAppleId, setAppAppleId] = useState(source.configuration.app_apple_id ?? "");
+  const [appStoreEnvironment, setAppStoreEnvironment] = useState(source.configuration.environment ?? "both");
+  const [appStoreIssuerId, setAppStoreIssuerId] = useState("");
+  const [appStoreKeyId, setAppStoreKeyId] = useState("");
+  const [appStorePrivateKey, setAppStorePrivateKey] = useState("");
+  const [googlePushServiceAccountEmail, setGooglePushServiceAccountEmail] = useState(source.configuration.pubsub_service_account_email ?? "");
+  const [googleSubscription, setGoogleSubscription] = useState(source.configuration.pubsub_subscription ?? "");
+  const [googleServiceAccount, setGoogleServiceAccount] = useState<Record<string, unknown> | null>(null);
+  const [googleServiceAccountFileName, setGoogleServiceAccountFileName] = useState("");
 
   function saveCredentials(event: FormEvent) {
     event.preventDefault();
     setCredentialsParseError(null);
+    if (source.source_type === "app_store") {
+      if (appStoreEnvironment !== "sandbox" && !appAppleId.trim() && !source.credential_keys.includes("app_apple_id")) {
+        setCredentialsParseError("Apple ID is required for production notifications.");
+        return;
+      }
+      const historyValues = [appStoreIssuerId, appStoreKeyId, appStorePrivateKey].map((value) => value.trim());
+      if (historyValues.some(Boolean) && !historyValues.every(Boolean)) {
+        setCredentialsParseError("Issuer ID, Key ID, and private key are all required to enable missed-notification recovery.");
+        return;
+      }
+      const credentials: Record<string, unknown> = { environment: appStoreEnvironment };
+      if (appAppleId.trim()) credentials.app_apple_id = appAppleId.trim();
+      if (historyValues.every(Boolean)) {
+        credentials.issuer_id = historyValues[0];
+        credentials.key_id = historyValues[1];
+        credentials.private_key = historyValues[2];
+      }
+      onConfigureCatchUp?.(credentials);
+      return;
+    }
+    if (source.source_type === "google_play") {
+      if (!googlePushServiceAccountEmail.trim() && source.verification_mode !== "shared_secret") {
+        setCredentialsParseError("Push authentication service account email is required.");
+        return;
+      }
+      if (googleSubscription.trim() && !/^projects\/[^/]+\/subscriptions\/[^/]+$/.test(googleSubscription.trim())) {
+        setCredentialsParseError("Subscription path must use projects/PROJECT_ID/subscriptions/SUBSCRIPTION_ID.");
+        return;
+      }
+      const credentials: Record<string, unknown> = {};
+      if (googlePushServiceAccountEmail.trim()) credentials.pubsub_service_account_email = googlePushServiceAccountEmail.trim();
+      if (googleSubscription.trim()) credentials.pubsub_subscription = googleSubscription.trim();
+      if (googleServiceAccount) credentials.service_account_json = googleServiceAccount;
+      onConfigureCatchUp?.(credentials);
+      return;
+    }
     if (!credentialsText.trim()) {
       setCredentialsParseError("Credentials JSON is required.");
       return;
@@ -1674,9 +2039,26 @@ function SourceCard({
     if (!configurePending && !configureError) {
       setEditingCredentials(false);
       setCredentialsText("");
+      setAppAppleId(source.configuration.app_apple_id ?? "");
+      setAppStoreEnvironment(source.configuration.environment ?? "both");
+      setAppStoreIssuerId("");
+      setAppStoreKeyId("");
+      setAppStorePrivateKey("");
+      setGooglePushServiceAccountEmail(source.configuration.pubsub_service_account_email ?? "");
+      setGoogleSubscription(source.configuration.pubsub_subscription ?? "");
+      setGoogleServiceAccount(null);
+      setGoogleServiceAccountFileName("");
       setCredentialsParseError(null);
     }
-  }, [configureError, configurePending, source.has_credentials]);
+  }, [
+    configureError,
+    configurePending,
+    source.configuration.app_apple_id,
+    source.configuration.environment,
+    source.configuration.pubsub_service_account_email,
+    source.configuration.pubsub_subscription,
+    source.has_credentials,
+  ]);
 
   return (
     <section className="source-card">
@@ -1708,7 +2090,13 @@ function SourceCard({
         <ul className="check-list">
           {source.setup_checklist.map((item) => (
             <li key={item.key}>
-              {item.done ? <Check size={15} /> : <X size={15} />}
+              {item.done ? (
+                <Check size={15} />
+              ) : item.optional ? (
+                <Minus className="optional-icon" size={15} />
+              ) : (
+                <X className="incomplete-icon" size={15} />
+              )}
               <span>{item.label}</span>
             </li>
           ))}
@@ -1740,16 +2128,52 @@ function SourceCard({
         </div>
         {editingCredentials && onConfigureCatchUp ? (
           <form className="source-credentials-form" onSubmit={saveCredentials}>
-            <Field label="Source credentials and verification JSON">
-              <TextArea
-                fullWidth
-                value={credentialsText}
-                onChange={(event) => setCredentialsText(event.target.value)}
-                placeholder={catchUpTemplate(source.source_type)}
-                rows={7}
-                variant="secondary"
+            {source.source_type === "app_store" ? (
+              <AppStoreCredentialsFields
+                appAppleId={appAppleId}
+                bundleId={source.configuration.bundle_id}
+                catchUpConfigured={source.catch_up_configured}
+                environment={appStoreEnvironment}
+                issuerId={appStoreIssuerId}
+                keyId={appStoreKeyId}
+                onAppAppleIdChange={setAppAppleId}
+                onEnvironmentChange={setAppStoreEnvironment}
+                onIssuerIdChange={setAppStoreIssuerId}
+                onKeyIdChange={setAppStoreKeyId}
+                onPrivateKeyChange={setAppStorePrivateKey}
+                privateKey={appStorePrivateKey}
               />
-            </Field>
+            ) : source.source_type === "google_play" ? (
+              <GooglePlayCredentialsFields
+                packageName={source.configuration.package_name}
+                webhookAudience={source.configuration.pubsub_oidc_audience}
+                pushServiceAccountEmail={googlePushServiceAccountEmail}
+                serviceAccount={googleServiceAccount}
+                serviceAccountConfigured={source.credential_keys.includes("service_account_json")}
+                serviceAccountFileName={googleServiceAccountFileName}
+                sharedSecretConfigured={source.verification_mode === "shared_secret"}
+                subscription={googleSubscription}
+                catchUpConfigured={source.catch_up_configured}
+                purchaseVerificationConfigured={source.purchase_verification_configured}
+                onPushServiceAccountEmailChange={setGooglePushServiceAccountEmail}
+                onServiceAccountChange={(value, fileName) => {
+                  setGoogleServiceAccount(value);
+                  setGoogleServiceAccountFileName(fileName);
+                }}
+                onSubscriptionChange={setGoogleSubscription}
+              />
+            ) : (
+              <Field label="Source credentials and verification JSON">
+                <TextArea
+                  fullWidth
+                  value={credentialsText}
+                  onChange={(event) => setCredentialsText(event.target.value)}
+                  placeholder={catchUpTemplate(source.source_type)}
+                  rows={7}
+                  variant="secondary"
+                />
+              </Field>
+            )}
             {credentialsParseError ? <p className="form-error">{credentialsParseError}</p> : null}
             {configureError ? <ErrorBlock error={configureError} /> : null}
             <div className="card-actions">

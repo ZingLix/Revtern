@@ -140,6 +140,18 @@ export interface DataSourceRecord {
   status: string;
   has_credentials: boolean;
   credential_keys: string[];
+  catch_up_configured: boolean;
+  purchase_verification_configured: boolean;
+  configuration: {
+    bundle_id?: string | null;
+    environment?: string | null;
+    app_apple_id?: string | null;
+    package_name?: string | null;
+    pubsub_oidc_audience?: string | null;
+    pubsub_service_account_email?: string | null;
+    pubsub_subscription?: string | null;
+    credential_service_account_email?: string | null;
+  };
   has_webhook_secret: boolean;
   verification_mode: "apple_jws" | "google_oidc" | "shared_secret" | "missing" | string;
   last_event_at?: string | null;
@@ -148,7 +160,7 @@ export interface DataSourceRecord {
   created_at: string;
   updated_at: string;
   webhook_url: string;
-  setup_checklist: Array<{ key: string; label: string; done: boolean }>;
+  setup_checklist: Array<{ key: string; label: string; done: boolean; optional?: boolean }>;
 }
 
 export type SourceType =

@@ -581,6 +581,14 @@ pre {
   color: var(--success);
 }
 
+.check-list .incomplete-icon {
+  color: var(--danger-soft-foreground);
+}
+
+.check-list .optional-icon {
+  color: var(--muted);
+}
+
 .issue-list svg {
   flex: none;
   color: var(--warning);
@@ -597,6 +605,133 @@ pre {
   gap: 10px;
   padding-top: 12px;
   border-top: 1px solid var(--separator);
+}
+
+.source-form-section {
+  display: grid;
+  gap: 12px;
+  padding-top: 4px;
+}
+
+.source-form-heading {
+  display: grid;
+  gap: 3px;
+}
+
+.source-form-heading strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.source-form-heading span,
+.field-help,
+.derived-field small,
+.advanced-settings small,
+.advanced-settings__content p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.source-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.derived-field {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--separator);
+  border-radius: var(--radius);
+  background: var(--default);
+}
+
+.derived-field > span {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.derived-field code {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.derived-field--missing code,
+.derived-field--missing small {
+  color: var(--danger-soft-foreground);
+}
+
+.advanced-settings {
+  border-top: 1px solid var(--separator);
+  border-bottom: 1px solid var(--separator);
+}
+
+.advanced-settings summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 2px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.advanced-settings summary:focus-visible {
+  border-radius: var(--radius);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.advanced-settings__content {
+  display: grid;
+  gap: 10px;
+  padding: 2px 2px 12px;
+}
+
+.advanced-settings__content p {
+  margin: 0;
+}
+
+.file-input {
+  width: 100%;
+  min-height: 38px;
+  padding: 6px;
+  border: 1px solid var(--separator);
+  border-radius: var(--radius);
+  background: var(--default);
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.file-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.file-input::file-selector-button {
+  margin-right: 10px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--foreground);
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.credential-ready {
+  color: var(--success);
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .draft-form-grid {
@@ -1069,10 +1204,16 @@ pre {
 
   .two-column,
   .draft-form-grid,
+  .source-form-grid,
   .inline-form,
   .invite-form,
   .role-guide {
     grid-template-columns: 1fr;
+  }
+
+  .derived-field {
+    grid-template-columns: 1fr;
+    gap: 3px;
   }
 
   .role-guide > div {
