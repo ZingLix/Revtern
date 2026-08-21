@@ -3,28 +3,40 @@
 .env.*
 !.env.example
 *.local
+.envrc
+.direnv/
 *.pem
 *.key
 *.p8
 *.p12
 *.mobileprovision
+*.jks
+*.keystore
 service-account*.json
 *-service-account.json
 google-credentials*.json
 gcp-key*.json
+google-services.json
+GoogleService-Info.plist
 
 # Dependencies
 node_modules/
 
 # Rust build output
 target/
+*.profraw
 
-# Frontend build output
+# Web and mobile build output
 dist/
 apps/web/dist/
+web-build/
 *.tsbuildinfo
 .vite/
+.expo/
+.metro-health-check*
 coverage/
+/apps/mobile/ios/
+/apps/mobile/android/
 
 # Logs and caches
 *.log
@@ -33,9 +45,21 @@ yarn-debug.log*
 yarn-error.log*
 .cache/
 .turbo/
+.eslintcache
+
+# Local AI, agent, and design-tool state
+.agents/
+.codex/
+.claude/
+.impeccable/
+skills-lock.json
+AGENTS.md
+CLAUDE.md
 
 # Editor and OS noise
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
 *.swp
+*.swo

@@ -33,7 +33,7 @@ The user starts with a self-host deployment.
 Expected MVP flow:
 
 ```bash
-git clone https://github.com/revtern/revtern
+git clone https://github.com/ZingLix/Revtern
 cd revtern
 cp .env.example .env
 docker compose up -d

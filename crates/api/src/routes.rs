@@ -36,6 +36,10 @@ pub fn router(state: AppState) -> Router {
                 .route("/setup/status", get(setup_status))
                 .route("/setup/owner", post(setup_owner))
                 .route("/session", post(create_session).delete(delete_session))
+                .route(
+                    "/mobile/session",
+                    post(create_mobile_session).delete(delete_mobile_session),
+                )
                 .route("/me", get(me))
                 .route("/apps", get(list_apps).post(create_app))
                 .route("/apps/{app_id}", patch(update_app))
@@ -192,6 +196,40 @@ async fn create_session(
     Ok((jar, Json(json!({ "logged_in": true }))))
 }
 
+async fn create_mobile_session(
+    State(state): State<AppState>,
+    Json(input): Json<LoginRequest>,
+) -> ApiResult<Json<Value>> {
+    if state.config.auth_mode != AuthMode::SingleUser {
+        return Err(ApiError::invalid(
+            "mobile password login requires single_user auth mode",
+        ));
+    }
+    let row = sqlx::query("select id, password_hash from users where email = $1")
+        .bind(input.email.trim().to_ascii_lowercase())
+        .fetch_optional(&state.pool)
+        .await?;
+    let row = row.ok_or_else(|| ApiError::Unauthorized("invalid email or password".to_string()))?;
+    let user_id: String = row.try_get("id")?;
+    let password_hash: String = row.try_get("password_hash")?;
+    if !auth::verify_password(&input.password, &password_hash) {
+        return Err(ApiError::Unauthorized(
+            "invalid email or password".to_string(),
+        ));
+    }
+    sqlx::query("update users set last_login_at = now() where id = $1")
+        .bind(&user_id)
+        .execute(&state.pool)
+        .await?;
+    let token = auth::create_bearer_session(&state.pool, &user_id).await?;
+    Ok(Json(json!({
+        "logged_in": true,
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": 2_592_000
+    })))
+}
+
 async fn delete_session(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -202,6 +240,16 @@ async fn delete_session(
     let _ = user;
     let jar = auth::clear_session(&state.pool, &headers, jar).await?;
     Ok((jar, Json(json!({ "logged_out": true }))))
+}
+
+async fn delete_mobile_session(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let _ = user;
+    auth::clear_bearer_session(&state.pool, &headers).await?;
+    Ok(Json(json!({ "logged_out": true })))
 }
 
 async fn me(user: CurrentUser) -> ApiResult<Json<Value>> {

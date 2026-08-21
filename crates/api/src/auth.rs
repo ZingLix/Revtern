@@ -6,7 +6,7 @@ use argon2::{
 };
 use axum::{
     extract::FromRequestParts,
-    http::{HeaderMap, Method, request::Parts},
+    http::{HeaderMap, Method, header::AUTHORIZATION, request::Parts},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use rand::RngCore;
@@ -150,6 +150,23 @@ pub async fn create_session(
     Ok(jar.add(session_cookie).add(csrf_cookie))
 }
 
+pub async fn create_bearer_session(pool: &sqlx::PgPool, user_id: &str) -> Result<String, ApiError> {
+    let session_id = new_id("ses");
+    let token = random_token();
+    let session_hash = sha256_hex(token.as_bytes());
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(30);
+    sqlx::query(
+        "insert into sessions (id, user_id, session_hash, expires_at, created_at, last_seen_at) values ($1, $2, $3, $4, now(), now())",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(session_hash)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(token)
+}
+
 pub async fn clear_session(
     pool: &sqlx::PgPool,
     headers: &HeaderMap,
@@ -169,15 +186,29 @@ pub async fn clear_session(
         .remove(Cookie::from(CSRF_COOKIE)))
 }
 
+pub async fn clear_bearer_session(
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    if let Some(token) = bearer_token(headers) {
+        sqlx::query("delete from sessions where session_hash = $1")
+            .bind(sha256_hex(token.as_bytes()))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn current_from_session(
     pool: &sqlx::PgPool,
     headers: &HeaderMap,
 ) -> Result<CurrentUser, ApiError> {
-    let jar = CookieJar::from_headers(headers);
-    let token = jar
-        .get(SESSION_COOKIE)
-        .map(|cookie| cookie.value().to_string())
-        .ok_or_else(|| ApiError::Unauthorized("login required".to_string()))?;
+    let token = bearer_token(headers).or_else(|| {
+        CookieJar::from_headers(headers)
+            .get(SESSION_COOKIE)
+            .map(|cookie| cookie.value().to_string())
+    });
+    let token = token.ok_or_else(|| ApiError::Unauthorized("login required".to_string()))?;
     let row = sqlx::query(
         r#"
         select u.id as user_id, u.email, wu.role, w.id as workspace_id, w.name as workspace_name
@@ -210,6 +241,16 @@ async fn current_from_session(
             name: row.try_get("workspace_name")?,
         },
     })
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 async fn current_from_reverse_proxy(
@@ -349,4 +390,30 @@ fn random_token() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+
+    use super::bearer_token;
+
+    #[test]
+    fn reads_bearer_token_from_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer device-session"),
+        );
+
+        assert_eq!(bearer_token(&headers).as_deref(), Some("device-session"));
+    }
+
+    #[test]
+    fn rejects_non_bearer_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic abc"));
+
+        assert_eq!(bearer_token(&headers), None);
+    }
 }

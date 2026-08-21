@@ -1,0 +1,44 @@
+{
+  "expo": {
+    "name": "Revtern",
+    "slug": "revtern",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/revtern-icon.svg.png",
+    "scheme": "revtern",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "icon": "./assets/images/revtern-icon.svg.png",
+      "bundleIdentifier": "dev.revtern.mobile",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "dev.revtern.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#171512",
+        "foregroundImage": "./assets/images/revtern-icon.svg.png"
+      },
+      "predictiveBackGestureEnabled": true
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#171512",
+          "image": "./assets/images/revtern-icon.svg.png",
+          "imageWidth": 72
+        }
+      ],
+      "expo-secure-store"
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}

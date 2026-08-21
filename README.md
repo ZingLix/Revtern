@@ -28,8 +28,8 @@ Core principles:
 - Backend: Rust, Axum, Tokio, SQLx.
 - Database: Postgres.
 - Web frontend: React, TypeScript, Vite.
-- Future mobile app: React Native, sharing API client, types, and business
-  logic with the web app where practical.
+- Mobile app: Expo SDK 57 and React Native, sharing the API client, types, and
+  business logic with the web app where practical.
 - Deployment: Docker Compose first, Kubernetes later if needed.
 
 ## Documentation
@@ -122,6 +122,12 @@ REVTERN_BIND=127.0.0.1:3001 cargo run -p revtern-api
 npm run dev:web
 ```
 
+To run the iOS/Android companion app after starting the API:
+
+```bash
+npm run dev:mobile
+```
+
 The Vite server proxies `/api` and `/webhooks` to `http://127.0.0.1:3001`
 by default. Set `VITE_API_BASE_URL` only when the API is running elsewhere.
 
@@ -155,6 +161,7 @@ Current layout:
 revtern/
   apps/
     web/                 React dashboard
+    mobile/              Expo iOS/Android companion app
   crates/
     api/                 Axum HTTP server
     core/                Domain model and business logic
@@ -167,3 +174,17 @@ revtern/
   deploy/
     docker-compose.yml
 ```
+
+## Contributing and Security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Please
+report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
+## License
+
+Revtern, including the server, web dashboard, shared packages, and mobile app,
+is licensed under the [Apache License 2.0](LICENSE). Official mobile builds may
+be sold through app stores; the source code remains available under the same
+license. Third-party components remain subject to their respective licenses.
+The license does not grant permission to present unofficial builds as official
+Revtern products or to use Revtern branding beyond customary attribution.

@@ -51,8 +51,23 @@ export interface CatalogConfirmation {
   ignored_source_product_ids: Id[];
 }
 
+export interface RevternApiOptions {
+  baseUrl?: string;
+  accessToken?: () => string | null | undefined | Promise<string | null | undefined>;
+}
+
 export class RevternApi {
-  constructor(private readonly baseUrl = "") {}
+  private readonly baseUrl: string;
+  private readonly accessToken?: RevternApiOptions["accessToken"];
+
+  constructor(options: string | RevternApiOptions = "") {
+    if (typeof options === "string") {
+      this.baseUrl = options;
+      return;
+    }
+    this.baseUrl = options.baseUrl ?? "";
+    this.accessToken = options.accessToken;
+  }
 
   setupStatus() {
     return this.get<SetupStatus>("/api/setup/status");
@@ -66,8 +81,16 @@ export class RevternApi {
     return this.post<{ logged_in: boolean }>("/api/session", input);
   }
 
+  mobileLogin(input: { email: string; password: string }) {
+    return this.post<{ logged_in: boolean; access_token: string; token_type: "Bearer"; expires_in: number }>("/api/mobile/session", input);
+  }
+
   logout() {
     return this.delete<{ logged_out: boolean }>("/api/session");
+  }
+
+  mobileLogout() {
+    return this.delete<{ logged_out: boolean }>("/api/mobile/session");
   }
 
   me() {
@@ -201,6 +224,10 @@ export class RevternApi {
     if (init.body) {
       headers.set("content-type", "application/json");
     }
+    const token = await this.accessToken?.();
+    if (token) {
+      headers.set("authorization", `Bearer ${token}`);
+    }
     const csrf = readCookie("revtern_csrf");
     if (csrf && init.method && !["GET", "HEAD", "OPTIONS"].includes(init.method)) {
       headers.set("x-csrf-token", csrf);
@@ -243,6 +270,9 @@ function query(params: Record<string, string | undefined>) {
 }
 
 function readCookie(name: string) {
+  if (typeof document === "undefined") {
+    return undefined;
+  }
   return document.cookie
     .split("; ")
     .find((part) => part.startsWith(`${name}=`))

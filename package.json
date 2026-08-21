@@ -1,20 +1,31 @@
 {
   "name": "revtern",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "packageManager": "npm@11.16.0",
+  "overrides": {
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
   "workspaces": [
     "apps/web",
+    "apps/mobile",
     "packages/api-client",
     "packages/types"
   ],
   "scripts": {
     "dev:api": "cargo run -p revtern-api",
     "dev:web": "npm run dev -w @revtern/web",
+    "dev:mobile": "npm run start -w @revtern/mobile",
     "build:web": "npm run build -w @revtern/web",
-    "typecheck": "npm run typecheck -w @revtern/web",
+    "typecheck": "npm run typecheck -w @revtern/web && npm run typecheck -w @revtern/mobile",
     "check:api": "cargo check",
     "check": "cargo check && npm run typecheck"
+  },
+  "devDependencies": {
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
   }
 }

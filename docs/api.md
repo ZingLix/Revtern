@@ -74,6 +74,38 @@ Request:
 
 Logs out the current session.
 
+### POST /api/mobile/session
+
+Creates a 30-day bearer session for an iOS or Android device. This endpoint is
+available in `single_user` auth mode and returns an opaque access token. The
+server stores only its hash.
+
+Request:
+
+```json
+{
+  "email": "dev@example.com",
+  "password": "password"
+}
+```
+
+Response:
+
+```json
+{
+  "logged_in": true,
+  "access_token": "opaque-token",
+  "token_type": "Bearer",
+  "expires_in": 2592000
+}
+```
+
+Authenticated mobile requests send `Authorization: Bearer <access_token>`.
+
+### DELETE /api/mobile/session
+
+Revokes the bearer session used for the request.
+
 ### GET /api/me
 
 Returns current user and workspace.

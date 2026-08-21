@@ -30,6 +30,7 @@ Behavior:
 - Email and password login.
 - Session cookie.
 - CSRF protection for browser requests.
+- Opaque, revocable bearer sessions for the mobile companion app.
 - All data belongs to one workspace.
 
 This is enough for most self-hosted indie developers.
@@ -118,6 +119,8 @@ Use:
 - Secure, HTTP-only, SameSite cookies.
 - Server-side sessions stored in Postgres.
 - CSRF token for state-changing browser requests.
+- Keychain/Keystore-backed bearer tokens on mobile, stored as hashes on the
+  server and revocable through `DELETE /api/mobile/session`.
 
 Avoid JWT-only browser auth for MVP. Server-side sessions are easier to revoke
 and inspect in a self-hosted admin tool.
@@ -135,4 +138,3 @@ Later additions:
 - Granular RBAC.
 
 Do not build these before the data pipeline and dashboard are useful.
-

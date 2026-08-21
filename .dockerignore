@@ -9,7 +9,18 @@ apps/web/node_modules
 target
 dist
 apps/web/dist
+apps/mobile/.expo
+apps/mobile/ios
+apps/mobile/android
 *.tsbuildinfo
+
+.agents
+.codex
+.claude
+.impeccable
+skills-lock.json
+AGENTS.md
+CLAUDE.md
 
 .DS_Store
 .idea
@@ -23,7 +34,12 @@ yarn-error.log*
 *.key
 *.p8
 *.p12
+*.jks
+*.keystore
+*.mobileprovision
 service-account*.json
 *-service-account.json
 google-credentials*.json
 gcp-key*.json
+google-services.json
+GoogleService-Info.plist
