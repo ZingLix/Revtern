@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -18,6 +18,7 @@ use time::{
     Date, Duration, OffsetDateTime, format_description::well_known::Rfc3339,
     macros::format_description,
 };
+use tracing::Instrument;
 
 use crate::{
     AppState,
@@ -2322,13 +2323,66 @@ async fn store_webhook_payload(
         sync_run_id,
         credentials,
     } = *context;
+    let provider_processing_started = Instant::now();
+    tracing::info!(
+        source_id,
+        source_type,
+        sync_run_id,
+        "preparing webhook payload for normalization"
+    );
     let processing_payload =
         purchase_lookup::processing_payload(source_type, payload, credentials).await;
+    if let Some(lookup) = processing_payload
+        .as_ref()
+        .and_then(|value| value.get("googlePlayPurchaseLookup"))
+    {
+        let lookup_status = lookup
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        if lookup_status == "error" {
+            tracing::warn!(
+                source_id,
+                source_type,
+                lookup_status,
+                elapsed_ms = provider_processing_started.elapsed().as_millis(),
+                "Google Play purchase lookup failed"
+            );
+        } else {
+            tracing::info!(
+                source_id,
+                source_type,
+                lookup_status,
+                environment = lookup
+                    .get("environment")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                elapsed_ms = provider_processing_started.elapsed().as_millis(),
+                "Google Play purchase lookup completed"
+            );
+        }
+    } else {
+        tracing::debug!(
+            source_id,
+            source_type,
+            elapsed_ms = provider_processing_started.elapsed().as_millis(),
+            "webhook provider preprocessing completed"
+        );
+    }
     let extraction_payload = processing_payload.as_ref().unwrap_or(payload);
     let fallback = payload_sha256(payload);
     let extracted = extract_event(source_type, extraction_payload, &fallback);
+    tracing::info!(
+        source_id,
+        source_type,
+        provider_event_type = %extracted.source_event_type,
+        environment = %extracted.environment,
+        has_product = extracted.external_product_id.is_some(),
+        "webhook event metadata extracted"
+    );
     let raw_id = new_id("raw");
     let sha = payload_sha256(payload);
+    tracing::info!(source_id, source_type, "storing webhook payload");
     let inserted = sqlx::query(
         r#"
         insert into raw_events (
@@ -2383,7 +2437,21 @@ async fn store_webhook_payload(
     .execute(&state.pool)
     .await?;
 
+    tracing::info!(
+        source_id,
+        source_type,
+        raw_event_id = %raw_event_id,
+        inserted,
+        "webhook payload stored"
+    );
+
     if !inserted {
+        tracing::info!(
+            source_id,
+            source_type,
+            raw_event_id = %raw_event_id,
+            "duplicate webhook delivery acknowledged"
+        );
         return Ok(StoredWebhookPayload {
             raw_event_id,
             inserted,
@@ -2392,11 +2460,38 @@ async fn store_webhook_payload(
     }
 
     let job_id = enqueue_normalization(&state.pool, &raw_event_id).await?;
+    tracing::info!(
+        source_id,
+        source_type,
+        raw_event_id = %raw_event_id,
+        job_id = %job_id,
+        "webhook normalization job enqueued"
+    );
+    let normalization_started = Instant::now();
     let processing_error = match process_normalization_job(&state.pool, &job_id, "api-inline").await
     {
-        Ok(()) => None,
+        Ok(()) => {
+            tracing::info!(
+                source_id,
+                source_type,
+                raw_event_id = %raw_event_id,
+                job_id = %job_id,
+                elapsed_ms = normalization_started.elapsed().as_millis(),
+                "webhook normalization completed"
+            );
+            None
+        }
         Err(error) => {
             let text = error.to_string();
+            tracing::warn!(
+                source_id,
+                source_type,
+                raw_event_id = %raw_event_id,
+                job_id = %job_id,
+                elapsed_ms = normalization_started.elapsed().as_millis(),
+                error = %text,
+                "webhook normalization failed"
+            );
             sqlx::query("update raw_events set processing_status = 'failed', processing_error = $2 where id = $1")
                 .bind(&raw_event_id)
                 .bind(&text)
@@ -2422,11 +2517,79 @@ async fn ingest_webhook(
     State(state): State<AppState>,
     Path((source_type_path, source_id)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
-    let source_type = normalize_source_type(&source_type_path)?;
+    let request_id = new_id("whreq");
+    let span = tracing::info_span!(
+        "webhook_request",
+        request_id = %request_id,
+        source_id = %source_id,
+        requested_source_type = %source_type_path
+    );
+    async move {
+        let started = Instant::now();
+        tracing::info!(
+            content_type = headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing"),
+            content_length = headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("unknown"),
+            authorization_present = headers.contains_key("authorization"),
+            "webhook request received"
+        );
+
+        let result = match payload {
+            Ok(Json(payload)) => {
+                tracing::info!(
+                    pubsub_message_id = payload
+                        .pointer("/message/messageId")
+                        .or_else(|| payload.pointer("/message/message_id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unavailable"),
+                    pubsub_subscription = payload
+                        .get("subscription")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unavailable"),
+                    "webhook JSON payload accepted"
+                );
+                process_webhook(&state, &source_type_path, &source_id, &headers, payload).await
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "webhook request body rejected");
+                Err(ApiError::invalid("webhook request body must be valid JSON"))
+            }
+        };
+
+        match &result {
+            Ok(_) => tracing::info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "webhook request completed"
+            ),
+            Err(error) => tracing::warn!(
+                elapsed_ms = started.elapsed().as_millis(),
+                error = ?error,
+                "webhook request failed"
+            ),
+        }
+        result
+    }
+    .instrument(span)
+    .await
+}
+
+async fn process_webhook(
+    state: &AppState,
+    source_type_path: &str,
+    source_id: &str,
+    headers: &HeaderMap,
+    payload: Value,
+) -> ApiResult<Json<Value>> {
+    let source_type = normalize_source_type(source_type_path)?;
     let source = sqlx::query("select * from data_sources where id = $1 and source_type = $2")
-        .bind(&source_id)
+        .bind(source_id)
         .bind(&source_type)
         .fetch_optional(&state.pool)
         .await?
@@ -2435,9 +2598,19 @@ async fn ingest_webhook(
     let app_id: String = source.try_get("app_id")?;
     let secret_hash: Option<String> = source.try_get("webhook_secret_hash")?;
     let encrypted_credentials: Option<String> = source.try_get("encrypted_credentials")?;
-    let credentials = optional_source_credentials(&state, encrypted_credentials.as_deref())?;
+    let credentials = optional_source_credentials(state, encrypted_credentials.as_deref())?;
+    tracing::info!(
+        source_type,
+        credentials_configured = credentials.is_some(),
+        shared_secret_configured = secret_hash.is_some(),
+        "webhook source resolved"
+    );
     let signature_verified = match source_type.as_str() {
         "app_store" => {
+            tracing::info!(
+                auth_method = "apple_jws",
+                "verifying webhook authentication"
+            );
             webhook_verification::verify_app_store_payload(&payload, credentials.as_ref())
                 .map_err(|error| {
                     tracing::warn!(source_id, ?error, "rejected unverified App Store webhook");
@@ -2445,29 +2618,50 @@ async fn ingest_webhook(
                         "App Store signed payload verification failed".to_string(),
                     )
                 })?;
+            tracing::info!(
+                auth_method = "apple_jws",
+                "webhook authentication succeeded"
+            );
             true
         }
         "google_play" => {
             let shared_secret_verified = webhook_verification::verify_shared_secret(
                 secret_hash.as_deref(),
-                &headers,
+                headers,
                 &payload,
             );
             let oidc_verified = if shared_secret_verified {
+                tracing::info!(
+                    auth_method = "shared_secret",
+                    "webhook authentication succeeded"
+                );
                 false
             } else {
-                webhook_verification::verify_google_pubsub_oidc(&headers, credentials.as_ref())
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(
-                            source_id,
-                            ?error,
-                            "rejected unverified Google Pub/Sub webhook"
-                        );
-                        ApiError::Unauthorized(
-                            "Google Pub/Sub push verification failed".to_string(),
-                        )
-                    })?
+                tracing::info!(
+                    auth_method = "google_pubsub_oidc",
+                    authorization_present = headers.contains_key("authorization"),
+                    "verifying webhook authentication"
+                );
+                let verified =
+                    webhook_verification::verify_google_pubsub_oidc(headers, credentials.as_ref())
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                source_id,
+                                ?error,
+                                "rejected unverified Google Pub/Sub webhook"
+                            );
+                            ApiError::Unauthorized(
+                                "Google Pub/Sub push verification failed".to_string(),
+                            )
+                        })?;
+                if verified {
+                    tracing::info!(
+                        auth_method = "google_pubsub_oidc",
+                        "webhook authentication succeeded"
+                    );
+                }
+                verified
             };
             if !oidc_verified && !shared_secret_verified {
                 return Err(ApiError::Unauthorized(
@@ -2475,6 +2669,7 @@ async fn ingest_webhook(
                         .to_string(),
                 ));
             }
+            tracing::info!("verifying Google Play notification package");
             webhook_verification::verify_google_play_package(&payload, credentials.as_ref())
                 .map_err(|error| {
                     tracing::warn!(source_id, ?error, "rejected Google Play package mismatch");
@@ -2482,32 +2677,52 @@ async fn ingest_webhook(
                         "Google Play notification package verification failed".to_string(),
                     )
                 })?;
+            tracing::info!("Google Play notification package matched");
             true
         }
         _ => {
             let verified = webhook_verification::verify_shared_secret(
                 secret_hash.as_deref(),
-                &headers,
+                headers,
                 &payload,
             );
             if secret_hash.is_some() && !verified {
+                tracing::warn!(
+                    auth_method = "shared_secret",
+                    "webhook authentication failed"
+                );
                 return Err(ApiError::Unauthorized(
                     "webhook secret verification failed".to_string(),
                 ));
             }
+            tracing::info!(
+                auth_method = if secret_hash.is_some() {
+                    "shared_secret"
+                } else {
+                    "none"
+                },
+                signature_verified = verified,
+                "webhook authentication completed"
+            );
             verified
         }
     };
     let store_context = WebhookStoreContext {
         workspace_id: &workspace_id,
         app_id: &app_id,
-        source_id: &source_id,
+        source_id,
         source_type: &source_type,
         signature_verified,
         sync_run_id: None,
         credentials: credentials.as_ref(),
     };
-    let stored = store_webhook_payload(&state, &payload, &store_context).await?;
+    let stored = store_webhook_payload(state, &payload, &store_context).await?;
+    tracing::info!(
+        raw_event_id = %stored.raw_event_id,
+        inserted = stored.inserted,
+        processing_failed = stored.processing_error.is_some(),
+        "webhook ingestion completed"
+    );
     Ok(Json(json!({
         "received": true,
         "raw_event_id": stored.raw_event_id,

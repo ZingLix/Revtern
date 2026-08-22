@@ -29,8 +29,16 @@ const APPLE_ROOT_CERTIFICATES_PEM: &str = include_str!("../certs/apple-root-cert
 const GOOGLE_OIDC_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
 const GOOGLE_JWKS_DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 const GOOGLE_JWKS_REFRESH_BACKOFF: Duration = Duration::from_secs(30);
+const GOOGLE_JWKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const GOOGLE_JWKS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-static GOOGLE_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
+static GOOGLE_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .connect_timeout(GOOGLE_JWKS_CONNECT_TIMEOUT)
+        .timeout(GOOGLE_JWKS_REQUEST_TIMEOUT)
+        .build()
+        .expect("build Google OIDC HTTP client")
+});
 static GOOGLE_JWKS_CACHE: LazyLock<Mutex<GoogleJwksCache>> =
     LazyLock::new(|| Mutex::new(GoogleJwksCache::default()));
 
@@ -181,21 +189,39 @@ async fn google_decoding_key(kid: &str) -> Result<DecodingKey> {
         .is_some();
 
     if cache_expired || !key_is_cached {
+        let refresh_reason = if cache_expired {
+            "cache_expired"
+        } else {
+            "unknown_key_id"
+        };
         let refresh_is_allowed = cache
             .last_refresh_attempt
             .is_none_or(|attempt| now.duration_since(attempt) >= GOOGLE_JWKS_REFRESH_BACKOFF);
         if !refresh_is_allowed {
+            tracing::warn!(
+                kid,
+                refresh_reason,
+                backoff_seconds = GOOGLE_JWKS_REFRESH_BACKOFF.as_secs(),
+                "Google OIDC signing key refresh suppressed by retry backoff"
+            );
             bail!("Google OIDC signing key refresh is temporarily unavailable");
         }
+        tracing::info!(
+            kid,
+            refresh_reason,
+            "Google OIDC signing key refresh required"
+        );
         cache.last_refresh_attempt = Some(now);
         let (jwks, ttl) = fetch_google_jwks().await?;
-        tracing::debug!(
+        tracing::info!(
             key_count = jwks.keys.len(),
             ttl_seconds = ttl.as_secs(),
-            "refreshed Google OIDC signing keys"
+            "Google OIDC signing key cache refreshed"
         );
         cache.jwks = Some(jwks);
         cache.expires_at = Some(Instant::now() + ttl);
+    } else {
+        tracing::debug!(kid, "using cached Google OIDC signing key");
     }
 
     let jwk = cache
@@ -207,27 +233,75 @@ async fn google_decoding_key(kid: &str) -> Result<DecodingKey> {
 }
 
 async fn fetch_google_jwks() -> Result<(JwkSet, Duration)> {
-    let response = GOOGLE_HTTP_CLIENT
-        .get(GOOGLE_OIDC_JWKS_URL)
-        .send()
-        .await
-        .context("Google OIDC signing key request failed")?
-        .error_for_status()
-        .context("Google OIDC signing key request failed")?;
+    let started = Instant::now();
+    tracing::info!(
+        url = GOOGLE_OIDC_JWKS_URL,
+        connect_timeout_ms = GOOGLE_JWKS_CONNECT_TIMEOUT.as_millis(),
+        request_timeout_ms = GOOGLE_JWKS_REQUEST_TIMEOUT.as_millis(),
+        https_proxy_configured = https_proxy_configured(),
+        "Google OIDC signing key request started"
+    );
+    let response = match GOOGLE_HTTP_CLIENT.get(GOOGLE_OIDC_JWKS_URL).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                elapsed_ms = started.elapsed().as_millis(),
+                is_timeout = error.is_timeout(),
+                is_connect = error.is_connect(),
+                error = %error,
+                "Google OIDC signing key request failed"
+            );
+            return Err(error).context("Google OIDC signing key request failed");
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(
+            status = %response.status(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "Google OIDC signing key endpoint returned an error"
+        );
+        let error = response
+            .error_for_status()
+            .expect_err("non-success Google OIDC response must be an error");
+        return Err(error).context("Google OIDC signing key request failed");
+    }
     let ttl = response
         .headers()
         .get(CACHE_CONTROL)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_cache_control_max_age)
         .unwrap_or(GOOGLE_JWKS_DEFAULT_TTL);
-    let jwks = response
-        .json::<JwkSet>()
-        .await
-        .context("Google OIDC signing key response is invalid")?;
+    let jwks = match response.json::<JwkSet>().await {
+        Ok(jwks) => jwks,
+        Err(error) => {
+            tracing::warn!(
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %error,
+                "Google OIDC signing key response is invalid"
+            );
+            return Err(error).context("Google OIDC signing key response is invalid");
+        }
+    };
     if jwks.keys.is_empty() {
+        tracing::warn!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "Google OIDC signing key response is empty"
+        );
         bail!("Google OIDC signing key response is empty");
     }
+    tracing::info!(
+        key_count = jwks.keys.len(),
+        ttl_seconds = ttl.as_secs(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "Google OIDC signing key request completed"
+    );
     Ok((jwks, ttl))
+}
+
+fn https_proxy_configured() -> bool {
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
 }
 
 fn parse_cache_control_max_age(value: &str) -> Option<Duration> {

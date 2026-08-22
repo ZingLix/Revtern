@@ -167,6 +167,17 @@ MVP implementation status:
 - Subscription renewals use the Play order id returned by Publisher lookup, so
   multiple charges sharing one purchase token remain separate ledger entries.
 
+### Webhook Diagnostics
+
+At the default `revtern_api=info` log level, each live webhook receives a
+`whreq_*` request id and logs the major processing stages: request receipt, JSON
+parsing, source lookup, authentication method, package verification, provider
+lookup, raw-event storage, deduplication, normalization, and completion or
+failure. Google OIDC key refreshes log their reason, proxy availability,
+duration, cache lifetime, and a timeout/connect classification on failure.
+Bearer tokens, private keys, complete payloads, and purchase tokens are never
+written to these diagnostic logs. Cache-hit details remain at debug level.
+
 Google uses the same RTDN webhook path for test and production purchase
 notifications. RTDN tells Revtern that a purchase changed, but it does not
 contain complete purchase details. To classify a purchase, Revtern calls:
