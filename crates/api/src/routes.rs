@@ -2043,7 +2043,7 @@ async fn metrics_revenue_timeseries(
         .unwrap_or_else(|| "USD".to_string());
     let mut query = QueryBuilder::<Postgres>::new(
         r#"
-        select d.date,
+        select d.date::date as date,
                coalesce(sum(ne.amount_minor) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted','renewal')),0)::bigint as gross_revenue_minor,
                coalesce(sum(abs(ne.amount_minor)) filter (where ne.event_type in ('refund','partial_refund','revocation')),0)::bigint as refund_amount_minor,
                (coalesce(sum(ne.amount_minor) filter (where ne.event_type in ('purchase','one_time_purchase','trial_converted','renewal')),0) - coalesce(sum(abs(ne.amount_minor)) filter (where ne.event_type in ('refund','partial_refund','revocation')),0))::bigint as net_revenue_minor,
@@ -2055,12 +2055,12 @@ async fn metrics_revenue_timeseries(
     query.push_bind(from);
     query.push("::date, ");
     query.push_bind(to);
-    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date and has_app_permission(");
+    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date::date and has_app_permission(");
     query.push_bind(&user.user.id);
     query.push(", ne.app_id, 'app.read') and ne.environment = 'production' and ne.currency = ");
     query.push_bind(&currency);
     push_normalized_filters(&mut query, &filters);
-    query.push(" group by d.date order by d.date asc");
+    query.push(" group by d.date::date order by d.date::date asc");
     let rows = query.build().fetch_all(&state.pool).await?;
     Ok(Json(json!({
         "series": rows.into_iter().map(daily_revenue_json).collect::<ApiResult<Vec<_>>>()?
@@ -2075,7 +2075,7 @@ async fn metrics_subscription_timeseries(
     let (from, to) = date_range(&filters)?;
     let mut query = QueryBuilder::<Postgres>::new(
         r#"
-        select d.date,
+        select d.date::date as date,
                count(distinct coalesce(ne.subscription_key, ne.transaction_key, ne.raw_event_id)) filter (where ne.event_type = 'purchase' and ne.subscription_key is not null) as new_subscription_count,
                count(ne.id) filter (where ne.event_type = 'renewal') as renewal_count,
                count(distinct coalesce(ne.subscription_key, ne.raw_event_id)) filter (where ne.event_type = 'cancellation') as cancel_count,
@@ -2088,7 +2088,7 @@ async fn metrics_subscription_timeseries(
     query.push_bind(from);
     query.push("::date, ");
     query.push_bind(to);
-    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date and has_app_permission(");
+    query.push("::date, interval '1 day') as d(date) left join metric_events ne on ne.occurred_at::date = d.date::date and has_app_permission(");
     query.push_bind(&user.user.id);
     query.push(", ne.app_id, 'app.read') and ne.environment = 'production'");
     push_optional_filter(&mut query, "ne.app_id", filters.get("app_id"));
@@ -2100,7 +2100,7 @@ async fn metrics_subscription_timeseries(
             .get("logical_product_id")
             .or_else(|| filters.get("product")),
     );
-    query.push(" group by d.date order by d.date asc");
+    query.push(" group by d.date::date order by d.date::date asc");
     let rows = query.build().fetch_all(&state.pool).await?;
     Ok(Json(json!({
         "series": rows.into_iter().map(daily_subscription_json).collect::<ApiResult<Vec<_>>>()?
