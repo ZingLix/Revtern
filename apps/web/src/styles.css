@@ -505,6 +505,10 @@ pre {
   border-bottom: 1px solid var(--separator);
 }
 
+.source-card {
+  container-type: inline-size;
+}
+
 .source-card:first-child,
 .draft-item:first-child {
   padding-top: 0;
@@ -598,6 +602,73 @@ pre {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.source-test {
+  display: grid;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--separator);
+}
+
+.source-test__head {
+  display: grid;
+  gap: 12px;
+}
+
+.source-test__head > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.source-test__head strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.source-test__head span {
+  max-width: 52ch;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.source-test__controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.source-test__environment {
+  flex: 1 1 132px;
+  width: 132px;
+}
+
+@container (min-width: 520px) {
+  .source-test__head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+  }
+
+  .source-test__controls {
+    flex: none;
+  }
+
+  .source-test__environment {
+    flex: none;
+  }
+}
+
+.source-test__result code {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  margin-top: 6px;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .source-credentials-form {
@@ -1118,7 +1189,7 @@ pre {
 
 @media (max-width: 1100px) {
   .app-shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .sidebar {
@@ -1137,7 +1208,7 @@ pre {
   }
 
   .two-column {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .settings-grid {
@@ -1208,7 +1279,7 @@ pre {
   .inline-form,
   .invite-form,
   .role-guide {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .derived-field {

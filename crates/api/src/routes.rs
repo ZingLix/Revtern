@@ -23,7 +23,10 @@ use crate::{
     AppState,
     access::{self, Capability},
     auth::{self, CsrfGuard, CurrentUser},
-    catchup::{CatchUpWindow, acknowledge_batch, fetch_webhook_notifications},
+    catchup::{
+        CatchUpWindow, acknowledge_batch, fetch_webhook_notifications,
+        request_app_store_test_notification,
+    },
     config::{AuthMode, RegistrationMode},
     crypto,
     error::{ApiError, ApiResult},
@@ -70,6 +73,10 @@ pub fn router(state: AppState) -> Router {
                     patch(update_data_source_credentials),
                 )
                 .route("/data-sources/{source_id}/test", post(test_data_source))
+                .route(
+                    "/data-sources/{source_id}/app-store-test-notification",
+                    post(send_app_store_test_notification),
+                )
                 .route(
                     "/data-sources/{source_id}/catch-up",
                     post(catch_up_data_source),
@@ -1049,6 +1056,11 @@ struct DataSourceCredentialsRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct AppStoreTestNotificationRequest {
+    environment: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CatchUpRequest {
     from: Option<String>,
     to: Option<String>,
@@ -1255,6 +1267,89 @@ async fn test_data_source(
     Ok(Json(
         json!({ "sync_run": get_sync_run_json(&state, &source_access.workspace_id, &sync_id).await? }),
     ))
+}
+
+async fn send_app_store_test_notification(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    _csrf: CsrfGuard,
+    Path(source_id): Path<String>,
+    Json(input): Json<AppStoreTestNotificationRequest>,
+) -> ApiResult<Json<Value>> {
+    let (source, source_access) =
+        authorized_source_row(&state, &user, &source_id, Capability::SourceWrite).await?;
+    let source_type: String = source.try_get("source_type")?;
+    if source_type != "app_store" {
+        return Err(ApiError::invalid(
+            "test notifications are only available for App Store sources",
+        ));
+    }
+
+    let environment = input.environment.trim().to_ascii_lowercase();
+    if !matches!(environment.as_str(), "production" | "sandbox") {
+        return Err(ApiError::invalid(
+            "environment must be production or sandbox",
+        ));
+    }
+
+    let encrypted_credentials: Option<String> = source.try_get("encrypted_credentials")?;
+    let credentials = optional_source_credentials(&state, encrypted_credentials.as_deref())?
+        .ok_or_else(|| {
+            ApiError::invalid(
+                "Configure an App Store In-App Purchase key before sending a test notification",
+            )
+        })?;
+    for key in ["issuer_id", "key_id", "private_key", "bundle_id"] {
+        if !credentials
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(ApiError::invalid(format!(
+                "Configure an App Store In-App Purchase key before sending a test notification ({key} is missing)"
+            )));
+        }
+    }
+
+    let configured_environment = credentials
+        .get("environment")
+        .and_then(Value::as_str)
+        .unwrap_or("both")
+        .trim()
+        .to_ascii_lowercase();
+    if configured_environment != "both" && configured_environment != environment {
+        return Err(ApiError::invalid(format!(
+            "this source is configured for {configured_environment}; update its environment before sending a {environment} test"
+        )));
+    }
+
+    let test_notification_token = request_app_store_test_notification(&credentials, &environment)
+        .await
+        .map_err(|error| {
+            ApiError::invalid(format!(
+                "Apple couldn't send the test notification. {error}"
+            ))
+        })?;
+    let requested_at = OffsetDateTime::now_utc();
+    access::audit(
+        &state.pool,
+        &user,
+        Some(&source_access.workspace_id),
+        Some(&source_access.app_id),
+        "source.app_store_test_notification_requested",
+        Some("data_source"),
+        Some(&source_id),
+        json!({ "environment": environment }),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "test_notification": {
+            "test_notification_token": test_notification_token,
+            "environment": environment,
+            "requested_at": dt(requested_at),
+        }
+    })))
 }
 
 async fn catch_up_data_source(
@@ -3549,7 +3644,7 @@ fn setup_checklist(
         "app_store" => vec![
             json!({"key": "notifications", "label": "Configure App Store Server Notification URL", "done": true}),
             json!({"key": "verification", "label": "Configure app identity for signed notification verification", "done": verification_mode == "apple_jws"}),
-            json!({"key": "catch_up", "label": "Configure missed-notification recovery", "done": catch_up_configured, "optional": true}),
+            json!({"key": "catch_up", "label": "Configure one-click tests and recovery", "done": catch_up_configured, "optional": true}),
             json!({"key": "signed_payload", "label": "Receive and verify a signedPayload notification", "done": has_event}),
         ],
         "google_play" => vec![

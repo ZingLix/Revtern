@@ -2,6 +2,8 @@ import type {
   AppRecord,
   AppMembersResponse,
   AppInvitationRecord,
+  AppStoreTestEnvironment,
+  AppStoreTestNotification,
   AuthIdentitiesResponse,
   AuthProvidersResponse,
   DataSourceRecord,
@@ -168,6 +170,13 @@ export class RevternApi {
 
   testDataSource(id: Id) {
     return this.post<{ sync_run: SyncRunRecord }>(`/api/data-sources/${id}/test`, {});
+  }
+
+  sendAppStoreTestNotification(id: Id, environment: AppStoreTestEnvironment) {
+    return this.post<{ test_notification: AppStoreTestNotification }>(
+      `/api/data-sources/${id}/app-store-test-notification`,
+      { environment },
+    );
   }
 
   catchUpDataSource(id: Id, input: { from?: string; to?: string; limit?: number; cursor?: string } = {}) {

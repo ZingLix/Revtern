@@ -163,6 +163,14 @@ export interface DataSourceRecord {
   setup_checklist: Array<{ key: string; label: string; done: boolean; optional?: boolean }>;
 }
 
+export type AppStoreTestEnvironment = "production" | "sandbox";
+
+export interface AppStoreTestNotification {
+  test_notification_token: string;
+  environment: AppStoreTestEnvironment;
+  requested_at: string;
+}
+
 export type SourceType =
   | "app_store"
   | "google_play"

@@ -229,9 +229,9 @@ Request:
 ```
 
 Webhook secrets are stored as hashes. Remaining credential fields are encrypted.
-App Store live ingestion requires `bundle_id`, `environment`, an Apple root
-certificate (`apple_root_ca_pem` or `apple_root_certificates`), and
-`app_apple_id` for production. Google Pub/Sub OIDC uses
+App Store live ingestion requires `bundle_id`, `environment`, and
+`app_apple_id` for production; Apple root certificates are bundled by the
+server. Google Pub/Sub OIDC uses
 `pubsub_oidc_audience` and `pubsub_service_account_email`. API keys and service
 account fields additionally enable notification catch-up and Play purchase
 lookup.
@@ -300,6 +300,24 @@ Returns source metadata, health, setup checklist, and webhook URL.
 ### POST /api/data-sources/{source_id}/test
 
 Runs a source health check.
+
+### POST /api/data-sources/{source_id}/app-store-test-notification
+
+Uses the encrypted In-App Purchase key on an App Store source to generate a
+short-lived JWT and ask Apple to send a signed `TEST` notification to the URL
+configured for the selected environment.
+
+Request:
+
+```json
+{
+  "environment": "sandbox"
+}
+```
+
+`environment` must be `sandbox` or `production` and must be enabled on the
+source. The response includes Apple's `test_notification_token`; delivery is
+confirmed separately when the webhook arrives.
 
 ### POST /api/data-sources/{source_id}/catch-up
 

@@ -8,6 +8,8 @@ use time::OffsetDateTime;
 pub(crate) const GOOGLE_ANDROID_PUBLISHER_SCOPE: &str =
     "https://www.googleapis.com/auth/androidpublisher";
 const GOOGLE_PUBSUB_SCOPE: &str = "https://www.googleapis.com/auth/pubsub";
+const APP_STORE_PRODUCTION_API: &str = "https://api.storekit.apple.com";
+const APP_STORE_SANDBOX_API: &str = "https://api.storekit-sandbox.apple.com";
 
 #[derive(Debug, Clone)]
 pub struct CatchUpWindow {
@@ -73,6 +75,39 @@ pub async fn acknowledge_batch(ack: CatchUpAck) -> Result<()> {
     }
 }
 
+pub async fn request_app_store_test_notification(
+    credentials: &Value,
+    environment: &str,
+) -> Result<String> {
+    let issuer_id = required_string(credentials, "issuer_id")?;
+    let key_id = required_string(credentials, "key_id")?;
+    let private_key = required_string(credentials, "private_key")?.replace("\\n", "\n");
+    let bundle_id = required_string(credentials, "bundle_id")?;
+    let host = app_store_api_host(environment)?;
+    let token = app_store_token(&issuer_id, &key_id, &private_key, &bundle_id)?;
+    let response = Client::new()
+        .post(format!("{host}/inApps/v1/notifications/test"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("contact Apple App Store Server API")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Apple rejected the test notification request ({status}): {}",
+            apple_error_detail(&body)
+        );
+    }
+
+    let response: AppStoreTestNotificationResponse = response
+        .json()
+        .await
+        .context("decode Apple test notification response")?;
+    Ok(response.test_notification_token)
+}
+
 async fn fetch_app_store_notifications(
     credentials: &Value,
     window: &CatchUpWindow,
@@ -82,11 +117,12 @@ async fn fetch_app_store_notifications(
     let private_key = required_string(credentials, "private_key")?.replace("\\n", "\n");
     let bundle_id = required_string(credentials, "bundle_id")?;
     let environment = optional_string(credentials, "environment").unwrap_or("production");
-    let host = if environment.eq_ignore_ascii_case("sandbox") {
-        "https://api.storekit-sandbox.itunes.apple.com"
+    let catch_up_environment = if environment.eq_ignore_ascii_case("sandbox") {
+        "sandbox"
     } else {
-        "https://api.storekit.itunes.apple.com"
+        "production"
     };
+    let host = app_store_api_host(catch_up_environment)?;
     let token = app_store_token(&issuer_id, &key_id, &private_key, &bundle_id)?;
     let client = Client::new();
     let mut body = json!({
@@ -215,6 +251,41 @@ fn app_store_token(
     .context("sign App Store Server API token")
 }
 
+fn app_store_api_host(environment: &str) -> Result<&'static str> {
+    match environment.trim().to_ascii_lowercase().as_str() {
+        "production" => Ok(APP_STORE_PRODUCTION_API),
+        "sandbox" => Ok(APP_STORE_SANDBOX_API),
+        _ => anyhow::bail!("environment must be production or sandbox"),
+    }
+}
+
+fn apple_error_detail(body: &str) -> String {
+    if let Ok(payload) = serde_json::from_str::<Value>(body) {
+        let code = payload.get("errorCode").and_then(|value| {
+            value
+                .as_i64()
+                .map(|value| value.to_string())
+                .or_else(|| value.as_str().map(str::to_string))
+        });
+        let message = payload
+            .get("errorMessage")
+            .or_else(|| payload.get("message"))
+            .and_then(Value::as_str);
+        match (code, message) {
+            (Some(code), Some(message)) => return format!("{message} (Apple error {code})"),
+            (Some(code), None) => return format!("Apple error {code}"),
+            (None, Some(message)) => return message.to_string(),
+            (None, None) => {}
+        }
+    }
+    let detail = body.trim().chars().take(300).collect::<String>();
+    if detail.is_empty() {
+        "Apple returned no error details".to_string()
+    } else {
+        detail
+    }
+}
+
 pub(crate) async fn google_access_token(credentials: &Value, scope: &str) -> Result<String> {
     let service_account = service_account_json(credentials)?;
     let client_email = required_string(&service_account, "client_email")?;
@@ -313,6 +384,12 @@ struct AppStoreNotificationHistoryResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct AppStoreTestNotificationResponse {
+    #[serde(rename = "testNotificationToken")]
+    test_notification_token: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AppStoreNotificationHistoryItem {
     #[serde(rename = "signedPayload")]
     signed_payload: String,
@@ -342,4 +419,83 @@ struct GooglePubSubMessage {
     publish_time: Option<String>,
     #[serde(default)]
     attributes: Option<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::Value;
+
+    use super::{
+        APP_STORE_PRODUCTION_API, APP_STORE_SANDBOX_API, app_store_api_host, app_store_token,
+        apple_error_detail,
+    };
+
+    const TEST_EC_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgNOhpRVBsAMfNltz1
+pxQZJyoutVhUyns5Ako6JC9AiXChRANCAARbIjWOTuemRha/gM58oLpkSlYIvX7h
+cECEi+uTVUOJ4L4z9hWtegF1pnFzQCpdlerO+Ait1tSiaDsDptTznsuA
+-----END PRIVATE KEY-----"#;
+
+    #[test]
+    fn app_store_api_host_requires_an_explicit_environment() {
+        assert_eq!(
+            app_store_api_host("production").expect("production host"),
+            APP_STORE_PRODUCTION_API
+        );
+        assert_eq!(
+            app_store_api_host("Sandbox").expect("sandbox host"),
+            APP_STORE_SANDBOX_API
+        );
+        assert!(app_store_api_host("both").is_err());
+    }
+
+    #[test]
+    fn apple_error_detail_prefers_structured_provider_message() {
+        assert_eq!(
+            apple_error_detail(
+                r#"{"errorCode":4040008,"errorMessage":"Server notification URL not found"}"#
+            ),
+            "Server notification URL not found (Apple error 4040008)"
+        );
+        assert_eq!(apple_error_detail(""), "Apple returned no error details");
+    }
+
+    #[test]
+    fn app_store_token_contains_the_required_apple_claims() {
+        let token = app_store_token(
+            "issuer-id",
+            "KEY123",
+            TEST_EC_PRIVATE_KEY,
+            "com.example.app",
+        )
+        .expect("signed App Store token");
+        let parts = token.split('.').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+
+        let header: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(parts[0])
+                .expect("JWT header encoding"),
+        )
+        .expect("JWT header JSON");
+        let claims: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(parts[1])
+                .expect("JWT claims encoding"),
+        )
+        .expect("JWT claims JSON");
+
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["kid"], "KEY123");
+        assert_eq!(header["typ"], "JWT");
+        assert_eq!(claims["iss"], "issuer-id");
+        assert_eq!(claims["aud"], "appstoreconnect-v1");
+        assert_eq!(claims["bid"], "com.example.app");
+        assert_eq!(
+            claims["exp"].as_i64().expect("expiration claim")
+                - claims["iat"].as_i64().expect("issued-at claim"),
+            20 * 60
+        );
+    }
 }

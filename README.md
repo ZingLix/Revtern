@@ -70,9 +70,10 @@ The first useful version should support:
   notification JWS and nested transaction/renewal JWS payloads, stores the raw
   source payload unchanged, and projects decoded lifecycle events. Incoming
   JWS signatures and their `x5c` certificate chains are verified against the
-  configured Apple root certificate before storage; bundle id, environment,
-  and production app Apple id claims are also checked. Missed notification
-  catch-up uses the same verification path.
+  bundled Apple root certificates before storage; bundle id, environment, and
+  production app Apple id claims are also checked. Configured In-App Purchase
+  keys enable one-click Sandbox or Production test notifications, and missed
+  notification catch-up uses the same verification path.
 - Google Play RTDN: accepts Cloud Pub/Sub push messages, decodes the base64
   `DeveloperNotification`, stores the raw source payload unchanged, and
   projects lifecycle events from the webhook payload. Pub/Sub push OIDC validates

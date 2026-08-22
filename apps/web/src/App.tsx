@@ -3,6 +3,8 @@ import type {
   AppMemberRecord,
   AppRecord,
   AppRoleRecord,
+  AppStoreTestEnvironment,
+  AppStoreTestNotification,
   DataSourceRecord,
   LogicalProductRecord,
   RawEventRecord,
@@ -49,6 +51,7 @@ import {
   Receipt,
   RefreshCw,
   Search,
+  Send,
   Settings,
   ShieldCheck,
   SquareStack,
@@ -1150,6 +1153,16 @@ function SourcesPage() {
     mutationFn: (id: string) => api.testDataSource(id),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["data-sources"] }),
   });
+  const appStoreTest = useMutation({
+    mutationFn: (input: { id: string; environment: AppStoreTestEnvironment }) =>
+      api.sendAppStoreTestNotification(input.id, input.environment),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["data-sources"] });
+      window.setTimeout(() => {
+        void queryClient.invalidateQueries({ queryKey: ["data-sources"] });
+      }, 2500);
+    },
+  });
   const catchUp = useMutation({
     mutationFn: (id: string) => api.catchUpDataSource(id),
     onSuccess: async () => {
@@ -1189,7 +1202,13 @@ function SourcesPage() {
               <SourceCard
                 key={source.id}
                 source={source}
-                onTest={selectedApp?.permissions.includes("source.write") ? () => test.mutate(source.id) : undefined}
+                onTest={selectedApp?.permissions.includes("source.write") && source.source_type !== "app_store" ? () => test.mutate(source.id) : undefined}
+                onSendAppStoreTest={selectedApp?.permissions.includes("source.write") && source.source_type === "app_store"
+                  ? (environment) => appStoreTest.mutate({ id: source.id, environment })
+                  : undefined}
+                appStoreTestPending={appStoreTest.isPending && appStoreTest.variables?.id === source.id}
+                appStoreTestResult={appStoreTest.variables?.id === source.id ? appStoreTest.data?.test_notification : undefined}
+                appStoreTestError={appStoreTest.variables?.id === source.id ? appStoreTest.error : null}
                 onConfigureCatchUp={selectedApp?.permissions.includes("source.credentials.write") && supportsCatchUp(source.source_type)
                   ? (credentials) => updateCredentials.mutate({ id: source.id, credentials })
                   : undefined}
@@ -1578,7 +1597,7 @@ function SourceForm({
         if (appAppleId.trim()) credentials.app_apple_id = appAppleId.trim();
         const historyValues = [appStoreIssuerId, appStoreKeyId, appStorePrivateKey].map((value) => value.trim());
         if (historyValues.some(Boolean) && !historyValues.every(Boolean)) {
-          setParseError("Issuer ID, Key ID, and private key are all required to enable missed-notification recovery.");
+          setParseError("Issuer ID, Key ID, and private key are all required to enable test notifications and recovery.");
           return;
         }
         if (historyValues.every(Boolean)) {
@@ -1797,11 +1816,11 @@ function AppStoreCredentialsFields({
       </div>
       <details className="advanced-settings">
         <summary>
-          <span>Missed-notification recovery</span>
+          <span>Test notifications and recovery</span>
           <small>{catchUpConfigured ? "Configured · leave blank to keep current key" : "Optional"}</small>
         </summary>
         <div className="advanced-settings__content">
-          <p>Only needed to use Catch up. Create an In-App Purchase key in App Store Connect.</p>
+          <p>Needed only for one-click tests and Catch up. Create an In-App Purchase key in App Store Connect.</p>
           <div className="source-form-grid">
             <Field label="Issuer ID">
               <Input fullWidth value={issuerId} onChange={(event) => onIssuerIdChange(event.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" variant="secondary" />
@@ -1954,15 +1973,23 @@ function GooglePlayCredentialsFields({
 function SourceCard({
   source,
   onTest,
+  onSendAppStoreTest,
   onCatchUp,
   onConfigureCatchUp,
+  appStoreTestPending,
+  appStoreTestResult,
+  appStoreTestError,
   configurePending,
   configureError,
 }: {
   source: DataSourceRecord;
   onTest?: () => void;
+  onSendAppStoreTest?: (environment: AppStoreTestEnvironment) => void;
   onCatchUp?: () => void;
   onConfigureCatchUp?: (credentials: Record<string, unknown>) => void;
+  appStoreTestPending?: boolean;
+  appStoreTestResult?: AppStoreTestNotification;
+  appStoreTestError?: unknown;
   configurePending?: boolean;
   configureError?: unknown;
 }) {
@@ -1975,6 +2002,9 @@ function SourceCard({
   const [appStoreIssuerId, setAppStoreIssuerId] = useState("");
   const [appStoreKeyId, setAppStoreKeyId] = useState("");
   const [appStorePrivateKey, setAppStorePrivateKey] = useState("");
+  const [appStoreTestEnvironment, setAppStoreTestEnvironment] = useState<AppStoreTestEnvironment>(
+    source.configuration.environment === "production" ? "production" : "sandbox",
+  );
   const [googlePushServiceAccountEmail, setGooglePushServiceAccountEmail] = useState(source.configuration.pubsub_service_account_email ?? "");
   const [googleSubscription, setGoogleSubscription] = useState(source.configuration.pubsub_subscription ?? "");
   const [googleServiceAccount, setGoogleServiceAccount] = useState<Record<string, unknown> | null>(null);
@@ -1990,7 +2020,7 @@ function SourceCard({
       }
       const historyValues = [appStoreIssuerId, appStoreKeyId, appStorePrivateKey].map((value) => value.trim());
       if (historyValues.some(Boolean) && !historyValues.every(Boolean)) {
-        setCredentialsParseError("Issuer ID, Key ID, and private key are all required to enable missed-notification recovery.");
+        setCredentialsParseError("Issuer ID, Key ID, and private key are all required to enable test notifications and recovery.");
         return;
       }
       const credentials: Record<string, unknown> = { environment: appStoreEnvironment };
@@ -2060,6 +2090,21 @@ function SourceCard({
     source.has_credentials,
   ]);
 
+  useEffect(() => {
+    setAppStoreTestEnvironment(
+      source.configuration.environment === "production" ? "production" : "sandbox",
+    );
+  }, [source.configuration.environment]);
+
+  const appStoreTestOptions = source.configuration.environment === "production"
+    ? [{ value: "production", label: "Production" }]
+    : source.configuration.environment === "sandbox"
+      ? [{ value: "sandbox", label: "Sandbox" }]
+      : [
+          { value: "sandbox", label: "Sandbox" },
+          { value: "production", label: "Production" },
+        ];
+
   return (
     <section className="source-card">
       <header className="source-card-head">
@@ -2101,6 +2146,52 @@ function SourceCard({
             </li>
           ))}
         </ul>
+        {source.source_type === "app_store" ? (
+          <div className="source-test">
+            <div className="source-test__head">
+              <div>
+                <strong>Apple test notification</strong>
+                <span>Apple sends a signed TEST event to this source's webhook URL.</span>
+              </div>
+              <div className="source-test__controls">
+                <SelectControl
+                  ariaLabel="Apple test environment"
+                  className="source-test__environment"
+                  value={appStoreTestEnvironment}
+                  onChange={(value) => setAppStoreTestEnvironment(value as AppStoreTestEnvironment)}
+                  options={appStoreTestOptions}
+                />
+                <Button
+                  isDisabled={!source.catch_up_configured || !onSendAppStoreTest || appStoreTestPending}
+                  onPress={() => onSendAppStoreTest?.(appStoreTestEnvironment)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  {appStoreTestPending ? <RefreshCw size={16} /> : <Send size={16} />}
+                  {appStoreTestPending ? "Requesting…" : "Send test"}
+                </Button>
+              </div>
+            </div>
+            {!source.catch_up_configured ? (
+              <span className="field-help">Add an In-App Purchase key under Configure to enable one-click tests.</span>
+            ) : !onSendAppStoreTest ? (
+              <span className="field-help">Your role can view this source but cannot send test notifications.</span>
+            ) : null}
+            {appStoreTestResult ? (
+              <Alert className="source-test__result" status="success">
+                <Alert.Indicator><Check size={16} /></Alert.Indicator>
+                <Alert.Content>
+                  <Alert.Title>Test requested</Alert.Title>
+                  <Alert.Description>
+                    Apple accepted the {titleize(appStoreTestResult.environment)} request. The setup checklist updates after the callback arrives.
+                  </Alert.Description>
+                  <code title={appStoreTestResult.test_notification_token}>{appStoreTestResult.test_notification_token}</code>
+                </Alert.Content>
+              </Alert>
+            ) : null}
+            {appStoreTestError ? <ErrorBlock error={appStoreTestError} /> : null}
+          </div>
+        ) : null}
         <div className="card-actions">
           {onTest ? <Button onPress={onTest} size="sm" variant="secondary">
             <RefreshCw size={16} />

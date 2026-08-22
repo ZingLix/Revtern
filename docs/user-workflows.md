@@ -188,16 +188,18 @@ User flow:
 1. User selects `App Store`.
 2. Revtern shows the App Store Server Notification URL.
 3. User configures the URL in App Store Connect.
-4. Revtern receives signed notifications.
-5. Revtern decodes the notification and nested transaction payloads.
-6. Revtern stores the raw notification and normalizes lifecycle events.
+4. If an In-App Purchase key is configured, the user can send a Sandbox or
+   Production test notification from the source card without generating a JWT.
+5. Revtern receives signed notifications.
+6. Revtern decodes the notification and nested transaction payloads.
+7. Revtern stores the raw notification and normalizes lifecycle events.
 
 What Revtern should explain clearly:
 
 - Revtern only pulls App Store notification history for missed-webhook
   catch-up.
-- App Store notification-history credentials are optional for live webhooks and
-  only required before running missed-webhook catch-up.
+- App Store Server API credentials are optional for live webhooks and only
+  required for one-click tests and missed-webhook catch-up.
 - Metrics use fields present in the notification payload.
 - Store payout-style numbers may differ from Revtern estimates.
 

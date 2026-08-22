@@ -1,9 +1,16 @@
+use std::{
+    collections::HashSet,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
+
 use anyhow::{Context, Result, bail};
 use axum::http::HeaderMap;
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use openssl::{
     bn::BigNum,
     ecdsa::EcdsaSig,
@@ -13,10 +20,26 @@ use openssl::{
     stack::Stack,
     x509::{X509, X509StoreContext, store::X509StoreBuilder},
 };
+use reqwest::{Client, header::CACHE_CONTROL};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 const APPLE_ROOT_CERTIFICATES_PEM: &str = include_str!("../certs/apple-root-certificates.pem");
+const GOOGLE_OIDC_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
+const GOOGLE_JWKS_DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
+const GOOGLE_JWKS_REFRESH_BACKOFF: Duration = Duration::from_secs(30);
+
+static GOOGLE_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
+static GOOGLE_JWKS_CACHE: LazyLock<Mutex<GoogleJwksCache>> =
+    LazyLock::new(|| Mutex::new(GoogleJwksCache::default()));
+
+#[derive(Default)]
+struct GoogleJwksCache {
+    jwks: Option<JwkSet>,
+    expires_at: Option<Instant>,
+    last_refresh_attempt: Option<Instant>,
+}
 
 #[derive(Debug, Deserialize)]
 struct AppleJwsHeader {
@@ -134,40 +157,116 @@ pub async fn verify_google_pubsub_oidc(
         .filter(|value| !value.is_empty())
         .context("Google Pub/Sub push is missing its Bearer token")?;
 
-    let response = reqwest::Client::new()
-        .get("https://oauth2.googleapis.com/tokeninfo")
-        .query(&[("id_token", token)])
+    let header = decode_header(token).context("Google Pub/Sub Bearer token header is invalid")?;
+    if header.alg != Algorithm::RS256 {
+        bail!("Google Pub/Sub Bearer token must use RS256");
+    }
+    let kid = header
+        .kid
+        .as_deref()
+        .context("Google Pub/Sub Bearer token is missing its key id")?;
+    let key = google_decoding_key(kid).await?;
+    verify_google_pubsub_token(token, &key, expected_audience, expected_email)?;
+    Ok(true)
+}
+
+async fn google_decoding_key(kid: &str) -> Result<DecodingKey> {
+    let mut cache = GOOGLE_JWKS_CACHE.lock().await;
+    let now = Instant::now();
+    let cache_expired = cache.expires_at.is_none_or(|expires_at| now >= expires_at);
+    let key_is_cached = cache
+        .jwks
+        .as_ref()
+        .and_then(|jwks| jwks.find(kid))
+        .is_some();
+
+    if cache_expired || !key_is_cached {
+        let refresh_is_allowed = cache
+            .last_refresh_attempt
+            .is_none_or(|attempt| now.duration_since(attempt) >= GOOGLE_JWKS_REFRESH_BACKOFF);
+        if !refresh_is_allowed {
+            bail!("Google OIDC signing key refresh is temporarily unavailable");
+        }
+        cache.last_refresh_attempt = Some(now);
+        let (jwks, ttl) = fetch_google_jwks().await?;
+        tracing::debug!(
+            key_count = jwks.keys.len(),
+            ttl_seconds = ttl.as_secs(),
+            "refreshed Google OIDC signing keys"
+        );
+        cache.jwks = Some(jwks);
+        cache.expires_at = Some(Instant::now() + ttl);
+    }
+
+    let jwk = cache
+        .jwks
+        .as_ref()
+        .and_then(|jwks| jwks.find(kid))
+        .context("Google Pub/Sub token signing key was not found")?;
+    DecodingKey::from_jwk(jwk).context("Google Pub/Sub token signing key is invalid")
+}
+
+async fn fetch_google_jwks() -> Result<(JwkSet, Duration)> {
+    let response = GOOGLE_HTTP_CLIENT
+        .get(GOOGLE_OIDC_JWKS_URL)
         .send()
         .await
-        .context("Google Pub/Sub token verification request failed")?;
-    if !response.status().is_success() {
-        bail!("Google Pub/Sub Bearer token is invalid");
-    }
-    let claims: Value = response
-        .json()
+        .context("Google OIDC signing key request failed")?
+        .error_for_status()
+        .context("Google OIDC signing key request failed")?;
+    let ttl = response
+        .headers()
+        .get(CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_cache_control_max_age)
+        .unwrap_or(GOOGLE_JWKS_DEFAULT_TTL);
+    let jwks = response
+        .json::<JwkSet>()
         .await
-        .context("invalid Google token verification response")?;
-    let audience_matches = claims.get("aud").is_some_and(|aud| match aud {
-        Value::String(value) => value == expected_audience,
-        Value::Array(values) => values
-            .iter()
-            .any(|value| value.as_str() == Some(expected_audience)),
-        _ => false,
-    });
-    let issuer_matches = matches!(
-        claims.get("iss").and_then(Value::as_str),
-        Some("accounts.google.com" | "https://accounts.google.com")
-    );
+        .context("Google OIDC signing key response is invalid")?;
+    if jwks.keys.is_empty() {
+        bail!("Google OIDC signing key response is empty");
+    }
+    Ok((jwks, ttl))
+}
+
+fn parse_cache_control_max_age(value: &str) -> Option<Duration> {
+    value.split(',').find_map(|directive| {
+        let (name, seconds) = directive.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("max-age") {
+            return None;
+        }
+        seconds
+            .trim()
+            .trim_matches('"')
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+    })
+}
+
+fn verify_google_pubsub_token(
+    token: &str,
+    key: &DecodingKey,
+    expected_audience: &str,
+    expected_email: &str,
+) -> Result<()> {
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[expected_audience]);
+    validation.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
+    validation.required_spec_claims =
+        HashSet::from(["aud".to_string(), "exp".to_string(), "iss".to_string()]);
+    let claims = decode::<Value>(token, key, &validation)
+        .context("Google Pub/Sub Bearer token signature or standard claims are invalid")?
+        .claims;
     let email_matches = claims.get("email").and_then(Value::as_str) == Some(expected_email);
     let email_verified = claims
         .get("email_verified")
         .is_some_and(|value| value.as_bool() == Some(true) || value.as_str() == Some("true"));
-    if !audience_matches || !issuer_matches || !email_matches || !email_verified {
-        bail!(
-            "Google Pub/Sub token claims do not match the configured audience and service account"
-        );
+    if !email_matches || !email_verified {
+        bail!("Google Pub/Sub token service account identity does not match the configured source");
     }
-    Ok(true)
+    Ok(())
 }
 
 pub fn verify_google_play_package(payload: &Value, credentials: Option<&Value>) -> Result<()> {
@@ -324,7 +423,10 @@ fn normalize_apple_environment(value: &str) -> &str {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use openssl::rsa::Rsa;
     use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn shared_secret_accepts_only_the_configured_value() {
@@ -382,5 +484,112 @@ mod tests {
 
         assert!(verify_google_play_package(&matching, Some(&credentials)).is_ok());
         assert!(verify_google_play_package(&mismatched, Some(&credentials)).is_err());
+    }
+
+    #[test]
+    fn google_cache_control_uses_max_age() {
+        assert_eq!(
+            parse_cache_control_max_age("public, max-age=19354, must-revalidate"),
+            Some(Duration::from_secs(19_354))
+        );
+        assert_eq!(
+            parse_cache_control_max_age("MAX-AGE=\"60\""),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(parse_cache_control_max_age("no-cache"), None);
+    }
+
+    #[test]
+    fn google_pubsub_token_is_verified_locally() {
+        let rsa = Rsa::generate(2048).expect("RSA key");
+        let private_pem = rsa.private_key_to_pem().expect("private key PEM");
+        let encoding_key = EncodingKey::from_rsa_pem(&private_pem).expect("encoding key");
+        let decoding_key = DecodingKey::from_rsa_components(
+            &URL_SAFE_NO_PAD.encode(rsa.n().to_vec()),
+            &URL_SAFE_NO_PAD.encode(rsa.e().to_vec()),
+        )
+        .expect("decoding key");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time")
+            .as_secs();
+        let mut claims = json!({
+            "aud": "https://example.com/webhooks/google-play/source",
+            "iss": "https://accounts.google.com",
+            "exp": now + 300,
+            "email": "pubsub-push@example.iam.gserviceaccount.com",
+            "email_verified": true
+        });
+        let token =
+            encode(&Header::new(Algorithm::RS256), &claims, &encoding_key).expect("signed token");
+
+        assert!(
+            verify_google_pubsub_token(
+                &token,
+                &decoding_key,
+                "https://example.com/webhooks/google-play/source",
+                "pubsub-push@example.iam.gserviceaccount.com"
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_google_pubsub_token(
+                &token,
+                &decoding_key,
+                "https://wrong.example.com",
+                "pubsub-push@example.iam.gserviceaccount.com"
+            )
+            .is_err()
+        );
+        assert!(
+            verify_google_pubsub_token(
+                &token,
+                &decoding_key,
+                "https://example.com/webhooks/google-play/source",
+                "wrong@example.iam.gserviceaccount.com"
+            )
+            .is_err()
+        );
+
+        claims["email_verified"] = Value::Bool(false);
+        let unverified_email_token =
+            encode(&Header::new(Algorithm::RS256), &claims, &encoding_key).expect("signed token");
+        assert!(
+            verify_google_pubsub_token(
+                &unverified_email_token,
+                &decoding_key,
+                "https://example.com/webhooks/google-play/source",
+                "pubsub-push@example.iam.gserviceaccount.com"
+            )
+            .is_err()
+        );
+
+        claims["email_verified"] = Value::Bool(true);
+        claims["iss"] = Value::String("https://attacker.example.com".to_string());
+        let wrong_issuer_token =
+            encode(&Header::new(Algorithm::RS256), &claims, &encoding_key).expect("signed token");
+        assert!(
+            verify_google_pubsub_token(
+                &wrong_issuer_token,
+                &decoding_key,
+                "https://example.com/webhooks/google-play/source",
+                "pubsub-push@example.iam.gserviceaccount.com"
+            )
+            .is_err()
+        );
+
+        claims["iss"] = Value::String("https://accounts.google.com".to_string());
+        claims["exp"] = Value::from(now - 120);
+        let expired_token =
+            encode(&Header::new(Algorithm::RS256), &claims, &encoding_key).expect("signed token");
+        assert!(
+            verify_google_pubsub_token(
+                &expired_token,
+                &decoding_key,
+                "https://example.com/webhooks/google-play/source",
+                "pubsub-push@example.iam.gserviceaccount.com"
+            )
+            .is_err()
+        );
     }
 }
